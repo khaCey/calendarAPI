@@ -1,0 +1,108 @@
+---
+alwaysApply: true
+---
+# Changelog + Versioning Rules (MUST FOLLOW)
+
+You are an agent working in this repository. You MUST maintain the version number and update CHANGELOG.md on every change you make.
+
+## Version Format
+v.1.0.YY.ZZ (Calendar Webhook app)
+
+- 1.0 = App/version line (fixed). DO NOT change unless the user explicitly instructs a version bump / new app.
+- **YY** = Production version. Increments on **deployment** only. DO NOT change on dev edits.
+- **ZZ** = Development iteration. Increments on **every dev change**. Resets to 00 for production entry; next dev after deploy is .01.
+
+## Starting Version
+This app started at:
+v.1.0.00.01
+
+## Dev Change Rule
+For every change you make:
+- Increment **ZZ** by 1 (keep 1.0 and YY unchanged).
+- Add a NEW changelog entry at the TOP of CHANGELOG.md using the updated version.
+- The changelog entry MUST include:
+  - File path(s)
+  - Function name(s) changed/added/removed
+  - Change type: Added / Changed / Fixed / Removed
+  - For Changed/Fixed items: include a clear "From: ..." and "To: ..." describing behaviour/logic differences.
+
+## Push / Deploy Rule
+- **After every edit:** Run `clasp push` to sync changes to Google Apps Script.
+- **After every deployed version:** When the user publishes/releases to production, run `git add`, `git commit`, and `git push` to sync the release to GitHub.
+
+## Publish / Production Rule
+If (and ONLY if) the user explicitly says publish/release/production/deploy live:
+- **Increment YY** by 1 (deployment bumps YY, not ZZ).
+- **Reset ZZ** to 00 (production entry uses ZZ=00).
+- Add a NEW "Production Release" entry at the TOP of CHANGELOG.md:
+  - Version must be v.1.0.YY.00 (e.g. v.1.0.01.00 for first deploy, v.1.0.02.00 for second)
+  - Include a concise "Release Summary" bullet list.
+- Push to GitHub: `git add`, `git commit`, `git push`.
+- After publishing, the NEXT dev change must be v.1.0.YY.01 (same YY, ZZ = 01)
+
+## Trigger Words (only act if user intent is explicit)
+Publish intent examples:
+- "publish"
+- "release"
+- "production"
+- "deploy live"
+
+Version bump intent examples:
+- "bump version"
+- "major version"
+- "next version line"
+
+App change intent examples:
+- "new app"
+- "different app"
+- "change app number"
+
+## Changelog Formatting (STRICT)
+- CHANGELOG.md must be newest-first (latest entry at the top).
+- Use this exact structure per entry:
+
+## v.1.0.YY.ZZ — Development
+Date: YYYY-MM-DD
+Type: Dev Change
+
+### Summary
+- ...
+
+### Changes (detailed)
+
+#### Added
+- path/file.ext
+  - functionName(args)
+    - Added: ...
+
+#### Changed
+- path/file.ext
+  - functionName(args)
+    - From: ...
+    - To: ...
+
+#### Fixed
+- path/file.ext
+  - functionName(args)
+    - From: ...
+    - To: ...
+
+#### Removed
+- path/file.ext
+  - functionName(args)
+    - Removed: ...
+
+Production entry structure:
+
+## v.1.0.YY.00 — Production Release
+Date: YYYY-MM-DD
+Type: Production
+
+### Release Summary
+- ...
+
+## Do Not
+- Do NOT skip updating CHANGELOG.md.
+- Do NOT increment YY on dev changes (deployment bumps YY, not ZZ).
+- Do NOT change the 1.0 prefix unless explicitly requested by the user.
+- Do NOT use vague descriptions like "refactored" without stating what changed from X to Y.
