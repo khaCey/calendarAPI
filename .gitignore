@@ -2,3 +2,6 @@ node_modules/
 .env
 *.log
 credentials/
+
+# Track .cursor folder (rules, config)
+!.cursor/
