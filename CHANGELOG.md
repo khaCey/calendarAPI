@@ -2,6 +2,30 @@
 
 All notable changes to the Calendar Webhook app will be documented in this file.
 
+## Unreleased
+
+### Changed
+- **`applyLessonBookEventColor_` (Code.js):** When `body.colorId` is omitted on `lesson_book_create`, **demo** and **owner** lessons no longer default to Banana/Basil — the event keeps the **calendar default color**. Regular lessons still default to Basil (`10`) if `colorId` is missing (legacy clients). Aligns with Node `bookingCalendarSync.js` omitting `colorId` for demo/owner.
+
+## v.1.0.09.01 — Development
+Date: 2026-03-04
+Type: Dev Change
+
+### Summary
+- Single `getScheduleDataForPolling` in Polling.js; real `diff.removed` for incremental polls (ScriptProperties key cache)
+
+### Changes (detailed)
+
+#### Fixed
+- **Duplicate global:** Removed `getScheduleDataForPolling` / `getScheduleCacheVersion_` from MonthlyCache.js (Apps Script last-wins merge).
+- **Polling.js** — `readScheduleSheetsForPolling()` reads **MonthlySchedule** only, filters rows to current script-timezone **yyyy-MM**; `getScheduleDataForPolling()` uses **ScheduleCacheState** (`getScheduleCacheState`) for `cacheVersion` / `lastUpdated` (aligned with `bumpScheduleCacheVersion()`).
+- **Code.js** — `doGet` poll branch: `POLL_PREVIOUS_ROW_KEYS` + `LAST_POLL_CACHE_VERSION` in Script Properties; `diff.removed` = keys present last poll but missing now; `full=1` resets stored keys/version; `changed: false` when no removals, key set, or cache version change.
+
+#### Added
+- **Polling.js** — `rowKeyFromLessonRow_`, `lessonKeysFromData_`, `loadPreviousPollKeys_`, `savePreviousPollKeysFromData_`, `sortedKeysJson_`, `loadLastPollCacheVersion_`, `saveLastPollCacheVersion_`.
+
+---
+
 ## v.1.0.06.01 — Development
 Date: 2026-02-18
 Type: Dev Change
