@@ -5,6 +5,7 @@ All notable changes to the Calendar Webhook app will be documented in this file.
 ## Unreleased
 
 ### Changed
+- **`Config.js`:** `WEBHOOK_URL` and `BOOKING_API_KEY` default to empty in source control; set real values in **Script properties** (or local-only `Config`) so secrets are not committed to Git.
 - **`applyLessonBookEventColor_` (Code.js):** When `body.colorId` is omitted on `lesson_book_create`, **demo** and **owner** lessons no longer default to Banana/Basil — the event keeps the **calendar default color**. Regular lessons still default to Basil (`10`) if `colorId` is missing (legacy clients). Aligns with Node `bookingCalendarSync.js` omitting `colorId` for demo/owner.
 
 ## v.1.0.09.01 — Development

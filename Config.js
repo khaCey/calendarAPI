@@ -1,10 +1,15 @@
 /**
  * Config.js — All shared constants. Apps Script merges files into one scope, so declare once here.
+ *
+ * Secrets: do not put real API keys in Git. Set BOOKING_API_KEY (and POLL_API_KEY, etc.) in
+ * Project Settings → Script properties, or run migratePropertiesFromConfig_() once after pasting
+ * values locally only. WEBHOOK_URL: paste from Deploy after publishing the web app.
  */
 
 // Webhook
-var WEBHOOK_URL = 'https://script.google.com/a/macros/greensquare.jp/s/AKfycbzO_0AOx5ySN_omhkmF14SyanY5A5Wy6m3xK35nO0Ox9i_AAmT4KVWRrs2TD7rsJ4Y3/exec';
+var WEBHOOK_URL = '';
 var WEBHOOK_LOG_SHEET = 'WebhookLog';
+var BOOKING_API_KEY = '';
 
 // Spreadsheets
 var SS_ID = '1nAxTJVh45mc6N9tX2Xr_B4DGQ-fG3s0LTp7eY4sacVo'; // Teacher Admin — lessons_today, AppState, WebhookLog
@@ -19,3 +24,4 @@ var OWNER_CALENDAR_ID = 'c_403306dccf2039f61a620a4cfc22424c5a6f79e945054e57f30ec
 // Derived (opened once at load)
 var STUDENTLIST = SpreadsheetApp.openById(STUDENTLIST_SS_ID);
 var APPSTATE_SHEET_NAME = 'AppState';
+var SCHEDULE_CACHE_STATE_SHEET = 'ScheduleCacheState';
