@@ -184,6 +184,32 @@ function clearLessonBookEventColor_(calId, event) {
   }
 }
 
+/** Same marker as server/lib/studentAdminCalendarDescription.js (poll / DB sync). */
+var STUDENT_ADMIN_DESC_BLOCK_ = '---student-admin---';
+
+function stripStudentAdminDescriptionBlock_(desc) {
+  var s = String(desc || '');
+  var idx = s.indexOf(STUDENT_ADMIN_DESC_BLOCK_);
+  if (idx < 0) return s;
+  return s.substring(0, idx).replace(/\s+$/, '');
+}
+
+/**
+ * Merge Student Admin metadata into event description (preserves text above the block).
+ * @param {string} existingDesc
+ * @param {{ awaiting_reschedule_date?: boolean }} merge
+ * @returns {string}
+ */
+function mergeStudentAdminDescriptionIntoEvent_(existingDesc, merge) {
+  if (!merge || typeof merge !== 'object') return String(existingDesc || '');
+  var ar = merge.awaiting_reschedule_date;
+  if (ar !== true && ar !== false) return String(existingDesc || '');
+  var base = stripStudentAdminDescriptionBlock_(existingDesc).trim();
+  var tail = STUDENT_ADMIN_DESC_BLOCK_ + '\nawaiting_reschedule_date=' + (ar ? '1' : '0');
+  if (!base) return tail;
+  return base + '\n\n' + tail;
+}
+
 /** GET handler — serves polling JSON for react-app sync. */
 function doGet() {
   try {
@@ -316,6 +342,76 @@ function doGet() {
 }
 
 /**
+ * For lesson_book_update / lesson_book_delete: resolve CalendarEvent, including one occurrence of a recurring series.
+ * Uses body.eventId first; when updateScope is thisInstanceOnly and the event is the series master, uses
+ * occurrenceStartIso (+ optional seriesMasterId) with getInstances().
+ *
+ * @param {GoogleAppsScript.Calendar.Calendar} cal
+ * @param {Object} body - POST JSON (eventId, seriesMasterId, occurrenceStartIso, updateScope)
+ * @return {GoogleAppsScript.Calendar.CalendarEvent|null}
+ */
+function resolveLessonBookCalendarEvent_(cal, body) {
+  var eventIdRaw = String(body.eventId || '').trim();
+  var seriesMasterId = String(body.seriesMasterId || '').trim();
+  var occurrenceStartIso = String(body.occurrenceStartIso || '').trim();
+  var updateScope = String(body.updateScope || 'thisInstanceOnly').trim().toLowerCase();
+  var thisInstanceOnly = updateScope === 'thisinstanceonly';
+
+  var ev = null;
+  if (eventIdRaw) {
+    try {
+      ev = cal.getEventById(eventIdRaw);
+    } catch (ignore) {}
+  }
+
+  if (ev && thisInstanceOnly) {
+    try {
+      var idStr = '';
+      try {
+        idStr = String(ev.getId ? ev.getId() : '');
+      } catch (e1) {}
+      var isInstanceId = idStr && /_\d{8}T\d{6}Z$/i.test(idStr);
+      var isRecurring = false;
+      try {
+        isRecurring = ev.isRecurringEvent && ev.isRecurringEvent();
+      } catch (e2) {}
+      if (isRecurring && !isInstanceId && occurrenceStartIso) {
+        var start = new Date(occurrenceStartIso);
+        if (!isNaN(start.getTime())) {
+          var end = new Date(start.getTime() + 2 * 60 * 60 * 1000);
+          var instances = ev.getInstances(start, end);
+          if (instances && instances.length > 0) ev = instances[0];
+        }
+      }
+    } catch (recErr) {}
+  }
+
+  if (!ev && thisInstanceOnly && seriesMasterId && occurrenceStartIso) {
+    try {
+      var master = cal.getEventById(seriesMasterId);
+      if (master) {
+        var isRec2 = false;
+        try {
+          isRec2 = master.isRecurringEvent && master.isRecurringEvent();
+        } catch (e3) {}
+        if (isRec2) {
+          var st = new Date(occurrenceStartIso);
+          if (!isNaN(st.getTime())) {
+            var en = new Date(st.getTime() + 2 * 60 * 60 * 1000);
+            var inst = master.getInstances(st, en);
+            if (inst && inst.length > 0) ev = inst[0];
+          }
+        } else {
+          ev = master;
+        }
+      }
+    } catch (ignore2) {}
+  }
+
+  return ev;
+}
+
+/**
  * Webhook handler — receives Calendar API push notifications.
  * Apps Script does not expose request headers, so we run sync on every POST.
  * Google POSTs when events change; we refresh lessons_today and return 200.
@@ -436,9 +532,9 @@ function doPost(e) {
         try {
           var cal2 = CalendarApp.getCalendarById(cals[ci]);
           if (!cal2) continue;
-          var ev2 = cal2.getEventById(eventIdRaw);
-          if (ev2) {
-            found = ev2;
+          var evTry = resolveLessonBookCalendarEvent_(cal2, body);
+          if (evTry) {
+            found = evTry;
             foundCalId = cals[ci];
             break;
           }
@@ -452,11 +548,16 @@ function doPost(e) {
       try { cacheMonthlyEventsForBothMonths(); } catch (cacheErr2) {}
       try { fetchAndCacheTodayLessons(); } catch (todayErr2) {}
 
+      var deletedId = eventIdRaw;
+      try {
+        deletedId = found.getId ? String(found.getId()) : eventIdRaw;
+      } catch (idErr) {}
+
       return jsonOutput_({
         ok: true,
         actionTaken: 'deleted',
         calendarId: foundCalId,
-        eventId: eventIdRaw,
+        eventId: deletedId,
       });
     }
     if (body && body.action === 'lesson_book_update') {
@@ -478,7 +579,7 @@ function doPost(e) {
         try {
           var calUpd = CalendarApp.getCalendarById(calsUpd[ui]);
           if (!calUpd) continue;
-          var evUpd = calUpd.getEventById(eventIdUpd);
+          var evUpd = resolveLessonBookCalendarEvent_(calUpd, body);
           if (evUpd) {
             foundUpd = evUpd;
             foundUpdCalId = calsUpd[ui];
@@ -489,6 +590,11 @@ function doPost(e) {
       if (!foundUpd) {
         return jsonOutput_({ ok: false, error: 'Calendar event not found', eventId: eventIdUpd });
       }
+
+      var resolvedId = eventIdUpd;
+      try {
+        resolvedId = foundUpd.getId ? String(foundUpd.getId()) : eventIdUpd;
+      } catch (ridErr) {}
 
       var nextTitle = String(body.title || '').trim();
       if (nextTitle) {
@@ -504,6 +610,19 @@ function doPost(e) {
         }
       }
 
+      if (body.mergeStudentAdminDescription && typeof body.mergeStudentAdminDescription === 'object') {
+        try {
+          var existingDescUpd = '';
+          try {
+            existingDescUpd = String(foundUpd.getDescription() || '');
+          } catch (gdUpd) {}
+          var mergedDesc = mergeStudentAdminDescriptionIntoEvent_(existingDescUpd, body.mergeStudentAdminDescription);
+          try {
+            foundUpd.setDescription(mergedDesc);
+          } catch (sdUpd) {}
+        } catch (mergeUpdErr) {}
+      }
+
       try { cacheMonthlyEventsForBothMonths(); } catch (cacheErr3) {}
       try { fetchAndCacheTodayLessons(); } catch (todayErr3) {}
 
@@ -511,7 +630,7 @@ function doPost(e) {
         ok: true,
         actionTaken: 'updated',
         calendarId: foundUpdCalId,
-        eventId: eventIdUpd,
+        eventId: resolvedId,
       });
     }
     if (body && body.action === 'student_upsert') {
