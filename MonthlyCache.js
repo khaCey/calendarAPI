@@ -114,10 +114,13 @@ function processEventsForMonth(events) {
       else if (arP === false) awaitingFromDesc = '0';
     } catch (eAr) {}
 
+    // Student Admin writes "Moved to/from <day>" (suffix or legacy prefix). Older titles used [RESCHEDULED].
+    // Graphite (8) alone = cancelled; graphite + Moved marker = rescheduled (do not overwrite to cancelled).
+    var movedMarkerRe = /Moved\s+(to|from)\s+(\?{3}|\d{1,2}(?:st|nd|rd|th))/i;
     var status = 'scheduled';
     if (/(placeholder)/i.test(title)) {
       status = 'reserved';
-    } else if (/\[RESCHEDULED\]/i.test(title)) {
+    } else if (movedMarkerRe.test(title) || /\[RESCHEDULED\]/i.test(title)) {
       status = 'rescheduled';
     } else {
       var color = event.getColor();
@@ -130,7 +133,12 @@ function processEventsForMonth(events) {
     var isKidsLesson = /子/.test(title);
     var startTime = event.getStartTime();
     var dateStr = Utilities.formatDate(startTime, Session.getScriptTimeZone(), 'yyyy-MM-dd');
-    var namePart = title.split('(')[0].replace(/\[RESCHEDULED\]\s*/gi, '').replace(/子/g, '');
+    var titleForNames = String(title || '')
+      .replace(/^\s*Moved\s+(?:to|from)\s+(?:\?{3}|\d{1,2}(?:st|nd|rd|th))\s*[·•\-]\s*/i, '')
+      .replace(/\s*[·•\-]\s*Moved\s+(?:to|from)\s+(?:\?{3}|\d{1,2}(?:st|nd|rd|th))\s*$/i, '')
+      .replace(/\[RESCHEDULED\]\s*/gi, '')
+      .trim();
+    var namePart = titleForNames.split('(')[0].replace(/子/g, '');
     var names = namePart.split(/\s+and\s+/i).map(function (n) { return n.trim(); }).filter(Boolean);
     var lastName = '';
     if (names.length > 1) {
