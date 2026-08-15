@@ -9,6 +9,9 @@
       }
     ]
   },
+  "oauthScopes": [
+    "https://www.googleapis.com/auth/calendar"
+  ],
   "exceptionLogging": "STACKDRIVER",
   "runtimeVersion": "V8"
 }
