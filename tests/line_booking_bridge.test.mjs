@@ -166,6 +166,7 @@ assert.deepEqual(JSON.parse(JSON.stringify(payload.lessons[0])), {
   occurrenceStartIso: '2026-08-20T01:00:00.000Z',
   start: '2026-08-20T01:00:00.000Z',
   end: '2026-08-20T01:50:00.000Z',
+  durationMinutes: 50,
   status: 'scheduled',
   canReschedule: true,
   rescheduleDirection: null,
@@ -174,6 +175,24 @@ assert.equal(response.text.includes('PRIVATE STUDENT NAME'), false);
 assert.equal(response.text.includes('existing description'), false);
 assert.equal(response.text.includes('Cafe'), false);
 console.log('ok - lesson list exposes only encrypted-token inputs and state');
+
+// Non-50-minute Calendar records must still be visible. They are read-only.
+listItems = [sourceApiEvent({
+  id: 'sixty-minute-id',
+  iCalUID: 'sixty-minute@google.com',
+  end: { dateTime: '2026-08-20T11:00:00+09:00' },
+})];
+response = post({
+  action: 'lesson_book_list',
+  key: 'worker-secret',
+  date: '2026-08-20',
+});
+payload = JSON.parse(response.text);
+assert.equal(payload.ok, true);
+assert.equal(payload.lessons.length, 1);
+assert.equal(payload.lessons[0].durationMinutes, 60);
+assert.equal(payload.lessons[0].canReschedule, false);
+console.log('ok - non-50-minute Calendar record remains visible as read-only');
 
 // Green Square-style reschedule: exact old API instance remains at the old
 // start/end, gets Graphite + Moved-to, and a separate destination is inserted.
@@ -291,4 +310,4 @@ assert.equal(payload.actionTaken, 'updated');
 assert.deepEqual(titleUpdates, ['Updated title only']);
 console.log('ok - metadata-only lesson_book_update remains backward compatible');
 
-console.log('\n5 bridge tests passed');
+console.log('\n6 bridge tests passed');
