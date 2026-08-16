@@ -10,7 +10,8 @@ The LINE MINI App remains hosted at `https://booking.kaelenoer.com/`. Cloudflare
 - The Green Square calendar and spreadsheet IDs are not present on this branch.
 - Regular, demo and owner bookings all use the private primary calendar unless separate IDs are explicitly configured.
 - Availability returns only merged busy intervals. It never returns private event titles, descriptions, attendees or event IDs.
-- Booking creation uses `LockService` and checks the calendar again while holding the lock to prevent two API requests from taking the same slot.
+- Booking creation and rescheduling use `LockService` and check the calendar again while holding the lock to prevent two API requests from taking the same slot.
+- Rescheduling is limited to a single 50-minute lesson occurrence. Whole-series time moves are rejected.
 - The Green Square spreadsheet synchronisation and contact-sync code are not included on this branch, so the project requests calendar access only.
 - The old tracked `.clasp.json` was removed so this branch cannot accidentally push into the existing Green Square Apps Script project.
 
@@ -122,11 +123,69 @@ If another event overlaps the requested period, GAS returns:
 
 `bookingKey` makes retries idempotent: resending the same booking returns the existing calendar event instead of creating a duplicate.
 
-The existing `lesson_book_update`, `lesson_book_delete`, `lesson_book_delete_series` and `reserved_hold_recurring_create` actions remain available and are routed through the configured private calendar.
+### Reschedule a booking
+
+Rescheduling extends the existing `lesson_book_update` action. Supplying both `start` and `end` opts into a time move. Metadata-only `lesson_book_update` requests continue to behave as before.
+
+Normal lesson:
+
+```http
+POST /exec
+Content-Type: application/json
+
+{
+  "action": "lesson_book_update",
+  "key": "BOOKING_API_KEY",
+  "eventId": "opaque-calendar-event-id",
+  "updateScope": "thisInstanceOnly",
+  "start": "2026-08-22T15:00:00+09:00",
+  "end": "2026-08-22T15:50:00+09:00"
+}
+```
+
+For a recurring lesson occurrence, include the original occurrence start so only that occurrence is moved:
+
+```json
+{
+  "action": "lesson_book_update",
+  "key": "BOOKING_API_KEY",
+  "eventId": "series-or-instance-id",
+  "seriesMasterId": "series-master-id",
+  "occurrenceStartIso": "2026-08-20T01:00:00.000Z",
+  "updateScope": "thisInstanceOnly",
+  "start": "2026-08-22T15:00:00+09:00",
+  "end": "2026-08-22T15:50:00+09:00"
+}
+```
+
+Successful response:
+
+```json
+{
+  "ok": true,
+  "actionTaken": "rescheduled",
+  "eventId": "resolved-event-id",
+  "start": "2026-08-22T06:00:00.000Z",
+  "end": "2026-08-22T06:50:00.000Z"
+}
+```
+
+Reschedule rules:
+
+- `start` and `end` must both be supplied.
+- The new duration must be exactly 50 minutes.
+- `updateScope` must be `thisInstanceOnly`.
+- Recurring lessons require `occurrenceStartIso`.
+- The destination slot is checked again while holding the booking lock.
+- An occupied destination returns the same `SLOT_UNAVAILABLE` error used by booking creation.
+- Metadata fields supported by the existing update action (`title`, color fields, and Student Admin description metadata) can be included in the same reschedule request.
+
+The existing `lesson_book_delete`, `lesson_book_delete_series` and `reserved_hold_recurring_create` actions remain available and are routed through the configured private calendar.
 
 ## Tests
 
 ```bash
 node tests/lesson_book_delete.test.mjs
 node tests/private_calendar.test.mjs
+node tests/reschedule.test.mjs
 ```
