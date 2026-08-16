@@ -1,8 +1,8 @@
 /**
  * LINE booking bridge for the private-calendar backend.
  *
- * Adds two server-to-server operations without changing the legacy Code.js
- * router implementation:
+ * Adds server-to-server operations without changing the legacy Code.js router:
+ *   - availability       -> busy windows excluding old rescheduled source slots
  *   - lesson_book_list   -> sanitised lesson references for the Worker
  *   - lesson_book_update with start/end -> Green Square-style reschedule
  *
@@ -15,6 +15,7 @@
  */
 
 var greenSquareOriginalDoPost_ = doPost;
+BOOKING_SCRIPT_REVISION = '2026-08-17-private-calendar-reschedule-history-v2';
 
 function parseLineBookingRequestBody_(e) {
   var raw = (e && e.postData && e.postData.contents) ? String(e.postData.contents) : '';
@@ -80,6 +81,69 @@ function applyLineRescheduleMarker_(baseTitle, direction, dayLabel) {
   var label = String(dayLabel || '').trim() || '???';
   var marker = 'Moved ' + dir + ' ' + label;
   return base ? (base + ' · ' + marker) : marker;
+}
+
+/**
+ * Availability for the LINE booking flow. Old rescheduled source events remain
+ * visible in Calendar for history, but they must not keep the old slot full.
+ */
+function getLineBookingAvailabilityBusyWindows_(window) {
+  var calendarId = getMainCalendarId_();
+  var pageToken = null;
+  var busy = [];
+
+  do {
+    var options = {
+      timeMin: window.timeMin,
+      timeMax: window.timeMax,
+      singleEvents: true,
+      orderBy: 'startTime',
+      showDeleted: false,
+      maxResults: 2500,
+      timeZone: 'Asia/Tokyo'
+    };
+    if (pageToken) options.pageToken = pageToken;
+
+    var result = Calendar.Events.list(calendarId, options);
+    var items = result.items || [];
+    for (var i = 0; i < items.length; i++) {
+      var event = items[i] || {};
+      if (event.status === 'cancelled' || event.transparency === 'transparent') continue;
+      if (lineBookingRescheduleDirection_(event.summary || '') === 'to') continue;
+
+      var start = calendarApiBoundaryToIso_(event.start);
+      var end = calendarApiBoundaryToIso_(event.end);
+      if (start && end && new Date(start).getTime() < new Date(end).getTime()) {
+        busy.push({ start: start, end: end });
+      }
+    }
+
+    pageToken = result.nextPageToken || null;
+  } while (pageToken);
+
+  return mergeBusyWindows_(busy);
+}
+
+function handleLineAvailability_(e, body) {
+  if (!lineBookingAuthorised_(e, body)) {
+    return jsonOutput_(withBookingRevision_({ ok: false, error: 'Unauthorized' }));
+  }
+
+  try {
+    var window = parsePrivateAvailabilityWindow_(body);
+    return jsonOutput_(withBookingRevision_({
+      ok: true,
+      timeZone: getPrivateCalendarTimeZone_(),
+      window: window,
+      busy: getLineBookingAvailabilityBusyWindows_(window)
+    }));
+  } catch (err) {
+    return jsonOutput_(withBookingRevision_({
+      ok: false,
+      error: String(err && err.message ? err.message : err),
+      code: 'REQUEST_ERROR'
+    }));
+  }
 }
 
 /**
@@ -377,6 +441,10 @@ function handleLineLessonReschedule_(e, body) {
 doPost = function (e) {
   var body = parseLineBookingRequestBody_(e);
   var action = String(body.action || '').trim().toLowerCase();
+
+  if (action === 'availability') {
+    return handleLineAvailability_(e, body);
+  }
 
   if (action === 'lesson_book_list') {
     return handleLineLessonList_(e, body);
