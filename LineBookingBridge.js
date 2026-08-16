@@ -6,18 +6,21 @@
  *   - lesson_book_list   -> sanitised lesson references for the Worker
  *   - lesson_book_update with start/end -> Green Square-style reschedule
  *
- * Rescheduling mirrors the original Green Square convention:
- *   - the source occurrence stays at the original date/time
- *   - the source becomes Graphite and gets "Moved to <day>"
- *   - a separate destination event is inserted with "Moved from <day>"
+ * Identity deliberately mirrors Student Admin:
+ *   eventId + occurrenceStartIso + seriesMasterId + updateScope=thisInstanceOnly
+ * are passed to the existing resolveLessonBookCalendarEvent_() helper.
  *
- * The exact Calendar API instance id is used for the source patch. This is
- * important for recurring events: patching the concrete instance creates an
- * exception at the original slot instead of moving/removing the occurrence.
+ * No apiEventId is required from LINE or the Worker.
+ *
+ * Reschedule result:
+ *   - source stays at its original date/time
+ *   - source title becomes "... · Moved to <day>"
+ *   - source becomes Graphite (8)
+ *   - a separate destination event is created as "... · Moved from <day>"
  */
 
 var greenSquareOriginalDoPost_ = doPost;
-BOOKING_SCRIPT_REVISION = '2026-08-17-private-calendar-lesson-list-v4';
+BOOKING_SCRIPT_REVISION = '2026-08-17-private-calendar-admin-reschedule-v5';
 
 function parseLineBookingRequestBody_(e) {
   var raw = (e && e.postData && e.postData.contents) ? String(e.postData.contents) : '';
@@ -85,6 +88,81 @@ function applyLineRescheduleMarker_(baseTitle, direction, dayLabel) {
   return base ? (base + ' · ' + marker) : marker;
 }
 
+function lineBookingSafeTitle_(event) {
+  try { return String(event && event.getTitle ? event.getTitle() : '').trim(); }
+  catch (err) { return ''; }
+}
+
+function lineBookingSafeDescription_(event) {
+  try { return String(event && event.getDescription ? event.getDescription() : ''); }
+  catch (err) { return ''; }
+}
+
+function lineBookingSafeLocation_(event) {
+  try { return String(event && event.getLocation ? event.getLocation() : ''); }
+  catch (err) { return ''; }
+}
+
+function lineBookingSafeColor_(event) {
+  try { return String(event && event.getColor ? event.getColor() : '').trim(); }
+  catch (err) { return ''; }
+}
+
+function lineBookingSafeId_(event) {
+  try { return String(event && event.getId ? event.getId() : '').trim(); }
+  catch (err) { return ''; }
+}
+
+function lineBookingSafeTime_(event, methodName) {
+  try {
+    if (!event || typeof event[methodName] !== 'function') return null;
+    var value = event[methodName]();
+    if (!value || typeof value.getTime !== 'function' || isNaN(value.getTime())) return null;
+    return value;
+  } catch (err) {
+    return null;
+  }
+}
+
+function lineBookingSameOccurrence_(left, right) {
+  if (!left || !right) return false;
+  if (left === right) return true;
+
+  var leftId = normalizeCalendarComparableId_(lineBookingSafeId_(left));
+  var rightId = normalizeCalendarComparableId_(lineBookingSafeId_(right));
+  if (leftId && rightId && leftId !== rightId) return false;
+
+  var leftStart = lineBookingSafeTime_(left, 'getStartTime');
+  var rightStart = lineBookingSafeTime_(right, 'getStartTime');
+  if (!leftStart || !rightStart) return false;
+  return leftStart.getTime() === rightStart.getTime();
+}
+
+function lineBookingDestinationConflict_(calendar, sourceEvent, startDate, endDate) {
+  var events = calendar.getEvents(startDate, endDate) || [];
+  for (var i = 0; i < events.length; i++) {
+    var candidate = events[i];
+    if (lineBookingSameOccurrence_(candidate, sourceEvent)) continue;
+    if (lineBookingRescheduleDirection_(lineBookingSafeTitle_(candidate)) === 'to') continue;
+    if (calendarEventOverlaps_(candidate, startDate, endDate)) return candidate;
+  }
+  return null;
+}
+
+function lineBookingDestinationDescription_(sourceDescription) {
+  var lines = String(sourceDescription || '').split(/\r?\n/);
+  var kept = [];
+  for (var i = 0; i < lines.length; i++) {
+    var line = String(lines[i] || '');
+    if (/^\s*BookingSyncKey\s*:/i.test(line)) continue;
+    kept.push(line);
+  }
+  while (kept.length && !String(kept[kept.length - 1]).trim()) kept.pop();
+  kept.push('Source: LINE reschedule');
+  kept.push('BookingSyncKey: LINE-RESCHEDULE-' + Utilities.getUuid());
+  return kept.join('\n');
+}
+
 /** Old "Moved to" source events remain visible for history but do not block. */
 function getLineBookingAvailabilityBusyWindows_(window) {
   var calendarId = getMainCalendarId_();
@@ -146,14 +224,9 @@ function handleLineAvailability_(e, body) {
 }
 
 /**
- * Return every timed Calendar record in the requested lesson window.
- *
- * Do NOT filter the list to exactly 50 minutes. Older/manual Calendar records
- * can have a different duration and still need to remain visible in lesson
- * history. A non-50-minute record is simply read-only in the LINE app.
- *
- * Private Calendar text is inspected server-side only to derive reschedule
- * state; the title/description/attendees/location are never returned.
+ * Return timed Calendar records without exposing title/description/attendees.
+ * The identity fields are server-to-server only; the Worker encrypts them into
+ * an opaque lesson token before anything is returned to browser JavaScript.
  */
 function getPrivateCalendarLessonReferences_(window) {
   var calendarId = getMainCalendarId_();
@@ -188,24 +261,22 @@ function getPrivateCalendarLessonReferences_(window) {
       if (!isFinite(startMs) || !isFinite(endMs) || startMs >= endMs) continue;
 
       var eventId = String(event.iCalUID || event.id || '').trim();
-      var apiEventId = String(event.id || '').trim();
       if (!eventId) continue;
 
       var durationMinutes = Math.round((endMs - startMs) / (60 * 1000));
       var direction = lineBookingRescheduleDirection_(event.summary || '');
       var sourceRescheduled = direction === 'to';
-      var exactFiftyMinutes = durationMinutes === 50;
 
       lessons.push({
         eventId: eventId,
-        apiEventId: apiEventId || null,
-        seriesMasterId: String(event.recurringEventId || '').trim() || null,
+        // CalendarApp resolves recurring instances most reliably from iCalUID + occurrence time.
+        seriesMasterId: event.recurringEventId ? eventId : null,
         occurrenceStartIso: start,
         start: start,
         end: end,
         durationMinutes: durationMinutes,
         status: sourceRescheduled ? 'rescheduled' : 'scheduled',
-        canReschedule: !sourceRescheduled && exactFiftyMinutes && !!apiEventId,
+        canReschedule: !sourceRescheduled && durationMinutes === 50,
         rescheduleDirection: direction || null
       });
     }
@@ -238,71 +309,49 @@ function handleLineLessonList_(e, body) {
   }
 }
 
-function lineBookingApiConflict_(calendarId, sourceApiEventId, moveWindow) {
-  var options = {
-    timeMin: moveWindow.startIso,
-    timeMax: moveWindow.endIso,
-    singleEvents: true,
-    orderBy: 'startTime',
-    showDeleted: false,
-    maxResults: 2500,
-    timeZone: 'Asia/Tokyo'
-  };
+/**
+ * Resolve exactly the way Student Admin's lesson_book_update path does.
+ */
+function resolveLineBookingSource_(body) {
+  var kind = String(body.lessonKind || body.kind || '').trim().toLowerCase();
+  var calendarIds = getConfiguredCalendarIdsForSearch_(kind);
 
-  var result = Calendar.Events.list(calendarId, options);
-  var items = result.items || [];
-  for (var i = 0; i < items.length; i++) {
-    var event = items[i] || {};
-    if (String(event.id || '') === String(sourceApiEventId || '')) continue;
-    if (event.status === 'cancelled' || event.transparency === 'transparent') continue;
-    if (lineBookingRescheduleDirection_(event.summary || '') === 'to') continue;
-
-    var start = calendarApiBoundaryToIso_(event.start);
-    var end = calendarApiBoundaryToIso_(event.end);
-    if (!start || !end) continue;
-    if (
-      new Date(start).getTime() < moveWindow.endDate.getTime() &&
-      new Date(end).getTime() > moveWindow.startDate.getTime()
-    ) {
-      return event;
-    }
+  for (var i = 0; i < calendarIds.length; i++) {
+    try {
+      var calendar = openCalendarByConfiguredId_(calendarIds[i]);
+      if (!calendar) continue;
+      var event = resolveLessonBookCalendarEvent_(calendar, body);
+      if (event) {
+        return {
+          calendarId: calendarIds[i],
+          calendar: calendar,
+          event: event
+        };
+      }
+    } catch (err) {}
   }
+
   return null;
 }
 
-function lineBookingGetApiEvent_(calendarId, apiEventId) {
-  try {
-    return Calendar.Events.get(calendarId, apiEventId);
-  } catch (err) {
-    return null;
-  }
-}
+function createLineReschedulePairLikeAdmin_(resolved, body, moveWindow) {
+  var calendarId = resolved.calendarId;
+  var calendar = resolved.calendar;
+  var source = resolved.event;
 
-function lineBookingCopyOptionalApiFields_(source, destination) {
-  var src = source || {};
-  var dest = destination || {};
-  if (src.description) dest.description = src.description;
-  if (src.location) dest.location = src.location;
-  if (src.colorId) dest.colorId = src.colorId;
-  return dest;
-}
-
-/**
- * Patch the exact old Calendar API occurrence in place and insert the new one.
- * The old occurrence's start/end are never changed and it is never removed.
- */
-function createLineReschedulePairByApi_(calendarId, body, moveWindow) {
-  var apiEventId = String(body.apiEventId || '').trim();
-  if (!apiEventId) {
+  var occurrenceStartIso = String(body.occurrenceStartIso || '').trim();
+  if (!occurrenceStartIso) {
     return {
       ok: false,
-      error: 'Missing exact Calendar API occurrence id',
-      code: 'MISSING_API_EVENT_ID'
+      error: 'Missing occurrenceStartIso for reschedule',
+      code: 'MISSING_OCCURRENCE_START'
     };
   }
 
-  var source = lineBookingGetApiEvent_(calendarId, apiEventId);
-  if (!source || source.status === 'cancelled') {
+  var expectedStart = new Date(occurrenceStartIso);
+  var sourceStart = lineBookingSafeTime_(source, 'getStartTime');
+  var sourceEnd = lineBookingSafeTime_(source, 'getEndTime');
+  if (!sourceStart || !sourceEnd || isNaN(expectedStart.getTime())) {
     return {
       ok: false,
       error: 'Calendar event occurrence not found',
@@ -310,21 +359,7 @@ function createLineReschedulePairByApi_(calendarId, body, moveWindow) {
     };
   }
 
-  var sourceStartIso = calendarApiBoundaryToIso_(source.start);
-  var sourceEndIso = calendarApiBoundaryToIso_(source.end);
-  if (!sourceStartIso || !sourceEndIso) {
-    return {
-      ok: false,
-      error: 'Could not read source lesson time',
-      code: 'RESCHEDULE_EVENT_NOT_FOUND'
-    };
-  }
-
-  var requestedOccurrenceIso = String(body.occurrenceStartIso || '').trim();
-  if (
-    requestedOccurrenceIso &&
-    Math.abs(new Date(requestedOccurrenceIso).getTime() - new Date(sourceStartIso).getTime()) > 3 * 60 * 1000
-  ) {
+  if (Math.abs(sourceStart.getTime() - expectedStart.getTime()) > 3 * 60 * 1000) {
     return {
       ok: false,
       error: 'Lesson reference is stale',
@@ -332,7 +367,7 @@ function createLineReschedulePairByApi_(calendarId, body, moveWindow) {
     };
   }
 
-  var sourceTitle = String(source.summary || '').trim();
+  var sourceTitle = lineBookingSafeTitle_(source);
   if (lineBookingRescheduleDirection_(sourceTitle) === 'to') {
     return {
       ok: false,
@@ -341,7 +376,6 @@ function createLineReschedulePairByApi_(calendarId, body, moveWindow) {
     };
   }
 
-  var sourceStart = new Date(sourceStartIso);
   var baseTitle = stripLineRescheduleMarker_(sourceTitle);
   var sourceRescheduledTitle = applyLineRescheduleMarker_(
     baseTitle,
@@ -354,6 +388,10 @@ function createLineReschedulePairByApi_(calendarId, body, moveWindow) {
     lineBookingOrdinalDayFromDate_(sourceStart)
   );
 
+  var sourceDescription = lineBookingSafeDescription_(source);
+  var sourceLocation = lineBookingSafeLocation_(source);
+  var sourceColor = lineBookingSafeColor_(source);
+
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(10000)) {
     return {
@@ -365,7 +403,7 @@ function createLineReschedulePairByApi_(calendarId, body, moveWindow) {
 
   var destination = null;
   try {
-    if (lineBookingApiConflict_(calendarId, apiEventId, moveWindow)) {
+    if (lineBookingDestinationConflict_(calendar, source, moveWindow.startDate, moveWindow.endDate)) {
       return {
         ok: false,
         error: 'Slot unavailable',
@@ -373,39 +411,56 @@ function createLineReschedulePairByApi_(calendarId, body, moveWindow) {
       };
     }
 
-    var destinationResource = lineBookingCopyOptionalApiFields_(source, {
-      summary: destinationTitle,
-      start: { dateTime: moveWindow.startIso, timeZone: 'Asia/Tokyo' },
-      end: { dateTime: moveWindow.endIso, timeZone: 'Asia/Tokyo' }
-    });
-
     try {
-      destination = Calendar.Events.insert(destinationResource, calendarId);
-    } catch (insertErr) {
+      destination = calendar.createEvent(
+        destinationTitle,
+        moveWindow.startDate,
+        moveWindow.endDate,
+        {
+          description: lineBookingDestinationDescription_(sourceDescription),
+          location: sourceLocation || ''
+        }
+      );
+      if (sourceColor && destination && typeof destination.setColor === 'function') {
+        try { destination.setColor(sourceColor); } catch (destinationColorErr) {}
+      }
+    } catch (createErr) {
       return {
         ok: false,
         error: 'Destination lesson creation failed: ' + String(
-          insertErr && insertErr.message ? insertErr.message : insertErr
+          createErr && createErr.message ? createErr.message : createErr
         ),
         code: 'RESCHEDULE_CREATE_FAILED'
       };
     }
 
-    var sourcePatch = {
-      summary: sourceRescheduledTitle,
-      colorId: '8'
-    };
-
     try {
-      Calendar.Events.patch(sourcePatch, calendarId, apiEventId);
-    } catch (patchErr) {
+      // Same source mutation as Admin: metadata only. Never setTime/delete source.
+      source.setTitle(sourceRescheduledTitle);
       try {
-        if (destination && destination.id) Calendar.Events.remove(calendarId, destination.id);
+        source.setColor('8');
+      } catch (setSourceColorErr) {
+        applyLessonBookEventColor_(calendarId, source, '8', String(body.lessonKind || '').toLowerCase());
+      }
+
+      if (sourceDescription) {
+        try {
+          source.setDescription(
+            mergeStudentAdminDescriptionIntoEvent_(
+              sourceDescription,
+              { awaiting_reschedule_date: false }
+            )
+          );
+        } catch (sourceDescriptionErr) {}
+      }
+    } catch (sourceUpdateErr) {
+      try {
+        if (destination && typeof destination.deleteEvent === 'function') destination.deleteEvent();
       } catch (rollbackErr) {}
       return {
         ok: false,
         error: 'Source lesson reschedule marker failed: ' + String(
-          patchErr && patchErr.message ? patchErr.message : patchErr
+          sourceUpdateErr && sourceUpdateErr.message ? sourceUpdateErr.message : sourceUpdateErr
         ),
         code: 'RESCHEDULE_SOURCE_UPDATE_FAILED'
       };
@@ -414,11 +469,11 @@ function createLineReschedulePairByApi_(calendarId, body, moveWindow) {
     return {
       ok: true,
       actionTaken: 'rescheduled',
-      sourceEventId: String(source.iCalUID || body.eventId || ''),
-      sourceApiEventId: apiEventId,
-      destinationEventId: destination && destination.id ? String(destination.id) : null,
-      sourceStart: sourceStartIso,
-      sourceEnd: sourceEndIso,
+      calendarId: calendarId,
+      sourceEventId: lineBookingSafeId_(source) || String(body.eventId || ''),
+      destinationEventId: lineBookingSafeId_(destination) || null,
+      sourceStart: sourceStart.toISOString(),
+      sourceEnd: sourceEnd.toISOString(),
       start: moveWindow.startIso,
       end: moveWindow.endIso
     };
@@ -441,40 +496,35 @@ function handleLineLessonReschedule_(e, body) {
     }));
   }
 
+  var occurrenceStartIso = String(body.occurrenceStartIso || '').trim();
+  if (!occurrenceStartIso) {
+    return jsonOutput_(withBookingRevision_({
+      ok: false,
+      error: 'Missing occurrenceStartIso for reschedule',
+      code: 'MISSING_OCCURRENCE_START'
+    }));
+  }
+
   var moveWindow = parseLessonBookMoveWindow_(body);
   if (moveWindow === null) return greenSquareOriginalDoPost_(e);
   if (!moveWindow.ok) return jsonOutput_(withBookingRevision_(moveWindow));
 
-  var kind = String(body.lessonKind || body.kind || '').trim().toLowerCase();
-  var calendarIds = getConfiguredCalendarIdsForSearch_(kind);
-  var apiEventId = String(body.apiEventId || '').trim();
-  if (!apiEventId) {
+  var resolved = resolveLineBookingSource_(body);
+  if (!resolved) {
     return jsonOutput_(withBookingRevision_({
       ok: false,
-      error: 'Missing exact Calendar API occurrence id',
-      code: 'MISSING_API_EVENT_ID'
+      error: 'Calendar event occurrence not found',
+      code: 'RESCHEDULE_EVENT_NOT_FOUND',
+      eventId: eventId
     }));
   }
 
-  for (var i = 0; i < calendarIds.length; i++) {
-    var source = lineBookingGetApiEvent_(calendarIds[i], apiEventId);
-    if (!source) continue;
-    return jsonOutput_(withBookingRevision_(
-      createLineReschedulePairByApi_(calendarIds[i], body, moveWindow)
-    ));
-  }
-
-  return jsonOutput_(withBookingRevision_({
-    ok: false,
-    error: 'Calendar event occurrence not found',
-    code: 'RESCHEDULE_EVENT_NOT_FOUND',
-    eventId: eventId
-  }));
+  return jsonOutput_(withBookingRevision_(
+    createLineReschedulePairLikeAdmin_(resolved, body, moveWindow)
+  ));
 }
 
-// Apps Script compiles global function declarations before evaluating top-level
-// statements, so this assignment wraps the existing Code.js entry point while
-// retaining it for every action not handled here.
+// One wrapper only. Reschedule.js no longer wraps doPost.
 doPost = function (e) {
   var body = parseLineBookingRequestBody_(e);
   var action = String(body.action || '').trim().toLowerCase();
