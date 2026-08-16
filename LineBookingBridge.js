@@ -35,9 +35,9 @@ function lineBookingAuthorised_(e, body) {
 }
 
 /**
- * Return individual Calendar events with only the identifiers/times required by
- * the trusted Cloudflare Worker. No title, description, attendees, location or
- * other private event metadata is returned.
+ * Return individual 50-minute Calendar events with only the identifiers/times
+ * required by the trusted Cloudflare Worker. No title, description, attendees,
+ * location or other private event metadata is returned.
  */
 function getPrivateCalendarLessonReferences_(window) {
   var calendarId = getMainCalendarId_();
@@ -66,6 +66,7 @@ function getPrivateCalendarLessonReferences_(window) {
       var start = calendarApiBoundaryToIso_(event.start);
       var end = calendarApiBoundaryToIso_(event.end);
       if (!start || !end || new Date(start).getTime() >= new Date(end).getTime()) continue;
+      if (new Date(end).getTime() - new Date(start).getTime() !== 50 * 60 * 1000) continue;
 
       // CalendarApp.getEventById() expects the iCal UID. Fall back to API id for
       // legacy/non-standard resources where iCalUID is unavailable.
