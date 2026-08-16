@@ -6,13 +6,14 @@ import vm from 'node:vm';
 const root = path.resolve(import.meta.dirname, '..');
 const properties = { BOOKING_API_KEY: 'worker-secret' };
 
-let calendarEvents = [];
-let eventById = null;
 let listItems = [];
+let apiEvents = new Map();
+let insertedResources = [];
+let patchedCalls = [];
+let removedCalls = [];
 let lockReleaseCount = 0;
-let createdEvents = [];
+let calendarAppEvent = null;
 let titleUpdates = [];
-let colorUpdates = [];
 
 function formatTokyoDay(date) {
   return new Intl.DateTimeFormat('en-US', {
@@ -22,35 +23,14 @@ function formatTokyoDay(date) {
 }
 
 const defaultCalendar = {
-  getId: () => 'private@example.com',
+  getId: () => 'primary',
   getName: () => 'Private calendar',
   getTimeZone: () => 'Asia/Tokyo',
   isMyPrimaryCalendar: () => true,
-  getEvents: () => calendarEvents,
+  getEvents: () => [],
   getEventById: id => {
-    if (!eventById) return null;
-    return String(eventById.getId()) === String(id) ? eventById : null;
-  },
-  createEvent: (title, start, end, options = {}) => {
-    let color = '';
-    const created = {
-      title,
-      start,
-      end,
-      options,
-      deleted: false,
-      getId: () => `created-${createdEvents.length + 1}@google.com`,
-      getStartTime: () => start,
-      getEndTime: () => end,
-      getTitle: () => title,
-      getDescription: () => String(options.description || ''),
-      getLocation: () => String(options.location || ''),
-      getColor: () => color,
-      setColor: next => { color = String(next || ''); },
-      deleteEvent: () => { created.deleted = true; },
-    };
-    createdEvents.push(created);
-    return created;
+    if (!calendarAppEvent) return null;
+    return String(calendarAppEvent.getId()) === String(id) ? calendarAppEvent : null;
   },
 };
 
@@ -81,9 +61,35 @@ const context = vm.createContext({
   Calendar: {
     Events: {
       list: () => ({ items: listItems }),
-      patch: () => ({}),
-      remove: () => {},
-      insert: () => ({ id: 'inserted-event-id' }),
+      get: (_calendarId, eventId) => {
+        const event = apiEvents.get(String(eventId));
+        if (!event) throw new Error('not found');
+        return structuredClone(event);
+      },
+      insert: (resource, _calendarId) => {
+        const created = {
+          ...structuredClone(resource),
+          id: `inserted-${insertedResources.length + 1}`,
+          iCalUID: `inserted-${insertedResources.length + 1}@google.com`,
+          status: 'confirmed',
+        };
+        insertedResources.push(created);
+        apiEvents.set(created.id, created);
+        return structuredClone(created);
+      },
+      patch: (resource, _calendarId, eventId) => {
+        const id = String(eventId);
+        const current = apiEvents.get(id);
+        if (!current) throw new Error('not found');
+        const updated = { ...current, ...structuredClone(resource) };
+        apiEvents.set(id, updated);
+        patchedCalls.push({ eventId: id, resource: structuredClone(resource) });
+        return structuredClone(updated);
+      },
+      remove: (_calendarId, eventId) => {
+        removedCalls.push(String(eventId));
+        apiEvents.delete(String(eventId));
+      },
     },
   },
   ContentService: {
@@ -126,46 +132,25 @@ function post(body) {
   });
 }
 
-function makeSourceEvent({ recurring = false, title = 'Keishi (Cafe) 2/4' } = {}) {
-  const start = new Date('2026-08-20T01:00:00.000Z');
-  const end = new Date('2026-08-20T01:50:00.000Z');
-  let currentTitle = title;
-  let currentColor = '10';
-  let description = 'existing description';
+function sourceApiEvent(overrides = {}) {
   return {
-    getId: () => 'lesson-ical-id@google.com',
-    getStartTime: () => start,
-    getEndTime: () => end,
-    getTitle: () => currentTitle,
-    getDescription: () => description,
-    getLocation: () => 'Cafe',
-    getColor: () => currentColor,
-    isRecurringEvent: () => recurring,
-    getInstances: () => [],
-    setTitle: next => {
-      currentTitle = String(next);
-      titleUpdates.push(currentTitle);
-    },
-    setDescription: next => { description = String(next || ''); },
-    setColor: next => {
-      currentColor = String(next || '');
-      colorUpdates.push(currentColor);
-    },
+    id: 'calendar-instance-id',
+    iCalUID: 'lesson-ical-id@google.com',
+    recurringEventId: 'series-master-id',
+    status: 'confirmed',
+    summary: 'Keishi (Cafe) 2/4',
+    description: 'existing description',
+    location: 'Cafe',
+    colorId: '10',
+    start: { dateTime: '2026-08-20T10:00:00+09:00' },
+    end: { dateTime: '2026-08-20T10:50:00+09:00' },
+    ...overrides,
   };
 }
 
-// Sanitised event list exposes state but never private Calendar text.
-listItems = [{
-  id: 'calendar-api-id',
-  iCalUID: 'lesson-ical-id@google.com',
-  summary: 'PRIVATE STUDENT NAME',
-  description: 'PRIVATE DESCRIPTION',
-  location: 'PRIVATE LOCATION',
-  attendees: [{ email: 'private@example.com' }],
-  start: { dateTime: '2026-08-20T10:00:00+09:00' },
-  end: { dateTime: '2026-08-20T10:50:00+09:00' },
-}];
-
+// Sanitised list includes exact API instance id for Worker encryption, while
+// private title/description/location still never leave GAS.
+listItems = [sourceApiEvent({ summary: 'PRIVATE STUDENT NAME' })];
 let response = post({
   action: 'lesson_book_list',
   key: 'worker-secret',
@@ -176,7 +161,8 @@ assert.equal(payload.ok, true);
 assert.equal(payload.lessons.length, 1);
 assert.deepEqual(JSON.parse(JSON.stringify(payload.lessons[0])), {
   eventId: 'lesson-ical-id@google.com',
-  seriesMasterId: null,
+  apiEventId: 'calendar-instance-id',
+  seriesMasterId: 'series-master-id',
   occurrenceStartIso: '2026-08-20T01:00:00.000Z',
   start: '2026-08-20T01:00:00.000Z',
   end: '2026-08-20T01:50:00.000Z',
@@ -185,18 +171,55 @@ assert.deepEqual(JSON.parse(JSON.stringify(payload.lessons[0])), {
   rescheduleDirection: null,
 });
 assert.equal(response.text.includes('PRIVATE STUDENT NAME'), false);
-assert.equal(response.text.includes('PRIVATE DESCRIPTION'), false);
-assert.equal(response.text.includes('private@example.com'), false);
-console.log('ok - lesson_book_list returns sanitized identity/time/state fields');
+assert.equal(response.text.includes('existing description'), false);
+assert.equal(response.text.includes('Cafe'), false);
+console.log('ok - lesson list exposes only encrypted-token inputs and state');
 
-// Source "Moved to" event is surfaced as rescheduled and not reschedulable.
-listItems = [{
-  id: 'old-api-id',
-  iCalUID: 'old-ical-id@google.com',
-  summary: 'Keishi (Cafe) 2/4 · Moved to 22nd',
-  start: { dateTime: '2026-08-20T10:00:00+09:00' },
-  end: { dateTime: '2026-08-20T10:50:00+09:00' },
-}];
+// Green Square-style reschedule: exact old API instance remains at the old
+// start/end, gets Graphite + Moved-to, and a separate destination is inserted.
+const source = sourceApiEvent();
+apiEvents = new Map([[source.id, structuredClone(source)]]);
+listItems = [];
+insertedResources = [];
+patchedCalls = [];
+removedCalls = [];
+lockReleaseCount = 0;
+response = post({
+  action: 'lesson_book_update',
+  key: 'worker-secret',
+  eventId: 'lesson-ical-id@google.com',
+  apiEventId: 'calendar-instance-id',
+  seriesMasterId: 'series-master-id',
+  occurrenceStartIso: '2026-08-20T01:00:00.000Z',
+  updateScope: 'thisInstanceOnly',
+  start: '2026-08-22T15:00:00+09:00',
+  end: '2026-08-22T15:50:00+09:00',
+});
+payload = JSON.parse(response.text);
+assert.equal(payload.ok, true);
+assert.equal(payload.actionTaken, 'rescheduled');
+assert.equal(insertedResources.length, 1);
+assert.equal(insertedResources[0].summary, 'Keishi (Cafe) 2/4 · Moved from 20th');
+assert.equal(insertedResources[0].start.dateTime, '2026-08-22T06:00:00.000Z');
+assert.equal(insertedResources[0].end.dateTime, '2026-08-22T06:50:00.000Z');
+assert.deepEqual(patchedCalls, [{
+  eventId: 'calendar-instance-id',
+  resource: {
+    summary: 'Keishi (Cafe) 2/4 · Moved to 22nd',
+    colorId: '8',
+  },
+}]);
+assert.deepEqual(removedCalls, []);
+const preserved = apiEvents.get('calendar-instance-id');
+assert.equal(preserved.start.dateTime, '2026-08-20T10:00:00+09:00');
+assert.equal(preserved.end.dateTime, '2026-08-20T10:50:00+09:00');
+assert.equal(preserved.summary, 'Keishi (Cafe) 2/4 · Moved to 22nd');
+assert.equal(preserved.colorId, '8');
+assert.equal(lockReleaseCount, 1);
+console.log('ok - exact source occurrence is patched in place and never removed');
+
+// Old Moved-to event is returned as rescheduled, and availability ignores it.
+listItems = [{ ...structuredClone(preserved) }];
 response = post({
   action: 'lesson_book_list',
   key: 'worker-secret',
@@ -206,52 +229,33 @@ payload = JSON.parse(response.text);
 assert.equal(payload.lessons[0].status, 'rescheduled');
 assert.equal(payload.lessons[0].canReschedule, false);
 assert.equal(payload.lessons[0].rescheduleDirection, 'to');
-assert.equal(response.text.includes('Moved to 22nd'), false);
-console.log('ok - source reschedule state is exposed without exposing title');
-
-// Green Square-style reschedule keeps source slot and creates a destination.
-eventById = makeSourceEvent();
-calendarEvents = [];
-createdEvents = [];
-titleUpdates = [];
-colorUpdates = [];
-lockReleaseCount = 0;
 response = post({
-  action: 'lesson_book_update',
+  action: 'availability',
   key: 'worker-secret',
-  eventId: 'lesson-ical-id@google.com',
-  occurrenceStartIso: '2026-08-20T01:00:00.000Z',
-  updateScope: 'thisInstanceOnly',
-  start: '2026-08-22T15:00:00+09:00',
-  end: '2026-08-22T15:50:00+09:00',
+  date: '2026-08-20',
 });
 payload = JSON.parse(response.text);
-assert.equal(payload.ok, true);
-assert.equal(payload.actionTaken, 'rescheduled');
-assert.equal(createdEvents.length, 1);
-assert.equal(createdEvents[0].title, 'Keishi (Cafe) 2/4 · Moved from 20th');
-assert.equal(createdEvents[0].start.toISOString(), '2026-08-22T06:00:00.000Z');
-assert.equal(createdEvents[0].end.toISOString(), '2026-08-22T06:50:00.000Z');
-assert.deepEqual(titleUpdates, ['Keishi (Cafe) 2/4 · Moved to 22nd']);
-assert.deepEqual(colorUpdates, ['8']);
-assert.equal(eventById.getStartTime().toISOString(), '2026-08-20T01:00:00.000Z');
-assert.equal(eventById.getEndTime().toISOString(), '2026-08-20T01:50:00.000Z');
-assert.equal(lockReleaseCount, 1);
-console.log('ok - reschedule preserves source and creates linked destination event');
+assert.deepEqual(payload.busy, []);
+console.log('ok - preserved source is history only and releases its old slot');
 
-// Occupied destination is rejected before a destination event is created.
-eventById = makeSourceEvent();
-createdEvents = [];
-lockReleaseCount = 0;
-calendarEvents = [{
-  getId: () => 'other-event@google.com',
-  getStartTime: () => new Date('2026-08-22T06:00:00.000Z'),
-  getEndTime: () => new Date('2026-08-22T06:50:00.000Z'),
+// Destination conflicts are rejected without patching/removing the source.
+apiEvents = new Map([[source.id, structuredClone(source)]]);
+listItems = [{
+  id: 'occupied-id',
+  iCalUID: 'occupied@google.com',
+  status: 'confirmed',
+  summary: 'Other lesson',
+  start: { dateTime: '2026-08-22T15:00:00+09:00' },
+  end: { dateTime: '2026-08-22T15:50:00+09:00' },
 }];
+insertedResources = [];
+patchedCalls = [];
+removedCalls = [];
 response = post({
   action: 'lesson_book_update',
   key: 'worker-secret',
   eventId: 'lesson-ical-id@google.com',
+  apiEventId: 'calendar-instance-id',
   occurrenceStartIso: '2026-08-20T01:00:00.000Z',
   updateScope: 'thisInstanceOnly',
   start: '2026-08-22T15:00:00+09:00',
@@ -260,32 +264,20 @@ response = post({
 payload = JSON.parse(response.text);
 assert.equal(payload.ok, false);
 assert.equal(payload.code, 'SLOT_UNAVAILABLE');
-assert.equal(createdEvents.length, 0);
-assert.equal(lockReleaseCount, 1);
-console.log('ok - reschedule rejects an occupied destination');
+assert.equal(insertedResources.length, 0);
+assert.equal(patchedCalls.length, 0);
+assert.equal(removedCalls.length, 0);
+console.log('ok - conflict leaves source untouched');
 
-// Already-rescheduled source cannot be moved again.
-eventById = makeSourceEvent({ title: 'Keishi (Cafe) 2/4 · Moved to 22nd' });
-calendarEvents = [];
-createdEvents = [];
-response = post({
-  action: 'lesson_book_update',
-  key: 'worker-secret',
-  eventId: 'lesson-ical-id@google.com',
-  occurrenceStartIso: '2026-08-20T01:00:00.000Z',
-  updateScope: 'thisInstanceOnly',
-  start: '2026-08-23T15:00:00+09:00',
-  end: '2026-08-23T15:50:00+09:00',
-});
-payload = JSON.parse(response.text);
-assert.equal(payload.ok, false);
-assert.equal(payload.code, 'ALREADY_RESCHEDULED');
-assert.equal(createdEvents.length, 0);
-console.log('ok - already-rescheduled source is protected');
-
-// Metadata-only update still falls through to the original Code.js route.
-calendarEvents = [];
-eventById = makeSourceEvent();
+// Metadata-only update still falls through to legacy Code.js behavior.
+calendarAppEvent = {
+  getId: () => 'lesson-ical-id@google.com',
+  getTitle: () => 'Original',
+  getDescription: () => '',
+  setTitle: next => titleUpdates.push(String(next)),
+  setDescription: () => {},
+  setColor: () => {},
+};
 titleUpdates = [];
 response = post({
   action: 'lesson_book_update',
@@ -299,4 +291,4 @@ assert.equal(payload.actionTaken, 'updated');
 assert.deepEqual(titleUpdates, ['Updated title only']);
 console.log('ok - metadata-only lesson_book_update remains backward compatible');
 
-console.log('\n6 bridge tests passed');
+console.log('\n5 bridge tests passed');
