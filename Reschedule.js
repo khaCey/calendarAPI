@@ -211,3 +211,131 @@ function applyLessonBookTimeUpdate_(calendarId, event, body) {
     lock.releaseLock();
   }
 }
+
+/**
+ * Dedicated lesson_book_update path used only when start/end are present.
+ * Metadata-only updates continue through the original Code.js handler.
+ */
+function handleLessonBookRescheduleUpdate_(e, body) {
+  var providedKey = '';
+  if (e && e.parameter && e.parameter.key) providedKey = String(e.parameter.key).trim();
+  if (!providedKey && body && body.key) providedKey = String(body.key).trim();
+  var expectedKey = getBookingApiKey_();
+  if (!expectedKey || providedKey !== expectedKey) {
+    logWebhookReceived(e, 'lesson_book_update reschedule unauthorized');
+    return jsonOutput_(withBookingRevision_({ ok: false, error: 'Unauthorized' }));
+  }
+
+  var move = parseLessonBookMoveWindow_(body);
+  if (!move || !move.ok) {
+    return jsonOutput_(withBookingRevision_(move || {
+      ok: false,
+      error: 'Missing reschedule start/end',
+      code: 'INVALID_RESCHEDULE_WINDOW'
+    }));
+  }
+
+  var eventId = String(body.eventId || '').trim();
+  if (!eventId) {
+    return jsonOutput_(withBookingRevision_({
+      ok: false,
+      error: 'Missing eventId',
+      code: 'MISSING_EVENT_ID'
+    }));
+  }
+
+  var updateKind = String(body.lessonKind || body.kind || '').trim().toLowerCase();
+  var calendarIds = getConfiguredCalendarIdsForSearch_(updateKind);
+  var foundEvent = null;
+  var foundCalendarId = null;
+
+  for (var i = 0; i < calendarIds.length; i++) {
+    try {
+      var calendar = openCalendarByConfiguredId_(calendarIds[i]);
+      if (!calendar) continue;
+      var candidate = resolveLessonBookCalendarEvent_(calendar, body);
+      if (candidate) {
+        foundEvent = candidate;
+        foundCalendarId = calendarIds[i];
+        break;
+      }
+    } catch (resolveErr) {}
+  }
+
+  if (!foundEvent) {
+    return jsonOutput_(withBookingRevision_({
+      ok: false,
+      error: 'Calendar event not found',
+      code: 'RESCHEDULE_EVENT_NOT_FOUND',
+      eventId: eventId
+    }));
+  }
+
+  var moveResult = applyLessonBookTimeUpdate_(foundCalendarId, foundEvent, body);
+  if (!moveResult.ok) {
+    return jsonOutput_(withBookingRevision_(moveResult));
+  }
+
+  // Preserve the metadata-update behaviour of the original lesson_book_update.
+  var nextTitle = String(body.title || '').trim();
+  if (nextTitle) {
+    try { foundEvent.setTitle(nextTitle); } catch (titleErr) {}
+  }
+
+  if (body.clearColor === true || String(body.clearColor || '').toLowerCase() === 'true') {
+    clearLessonBookEventColor_(foundCalendarId, foundEvent);
+  } else {
+    var nextColorId = String(body.colorId || '').trim();
+    if (nextColorId) {
+      applyLessonBookEventColor_(foundCalendarId, foundEvent, nextColorId, updateKind);
+    }
+  }
+
+  if (body.mergeStudentAdminDescription && typeof body.mergeStudentAdminDescription === 'object') {
+    try {
+      var existingDescription = '';
+      try { existingDescription = String(foundEvent.getDescription() || ''); } catch (getDescriptionErr) {}
+      var mergedDescription = mergeStudentAdminDescriptionIntoEvent_(
+        existingDescription,
+        body.mergeStudentAdminDescription
+      );
+      try { foundEvent.setDescription(mergedDescription); } catch (setDescriptionErr) {}
+    } catch (mergeDescriptionErr) {}
+  }
+
+  var resolvedId = lessonBookSafeEventId_(foundEvent) || eventId;
+  return jsonOutput_(withBookingRevision_({
+    ok: true,
+    actionTaken: 'rescheduled',
+    calendarId: foundCalendarId,
+    eventId: resolvedId,
+    start: moveResult.start,
+    end: moveResult.end
+  }));
+}
+
+/**
+ * Keep Code.js as the canonical router and intercept only time-moving
+ * lesson_book_update requests. Apps Script loads project functions into one
+ * global scope, so this wrapper can delegate every existing action unchanged.
+ */
+var privateCalendarDoPostBeforeReschedule_ = doPost;
+doPost = function(e) {
+  try {
+    var raw = (e && e.postData && e.postData.contents) ? String(e.postData.contents) : '';
+    var body = raw ? JSON.parse(raw) : {};
+    var action = String((body && body.action) || '').trim();
+    var hasMoveFields = !!(
+      body &&
+      (String(body.start || '').trim() || String(body.end || '').trim())
+    );
+
+    if (action === 'lesson_book_update' && hasMoveFields) {
+      return handleLessonBookRescheduleUpdate_(e, body);
+    }
+  } catch (parseErr) {
+    // Preserve the original router's JSON/error behaviour for malformed input.
+  }
+
+  return privateCalendarDoPostBeforeReschedule_(e);
+};
