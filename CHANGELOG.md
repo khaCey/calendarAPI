@@ -2,6 +2,54 @@
 
 All notable changes to the Calendar Webhook app will be documented in this file.
 
+## v.1.0.09.02 — Development
+Date: 2026-08-16
+Type: Dev Change
+
+### Summary
+- Convert the isolated branch into a calendar-only GAS backend for the LINE MINI App sandbox, using the deploying account's private primary Google Calendar.
+
+### Changes (detailed)
+
+#### Added
+- **`PrivateCalendar.js`** — Added `getMainCalendarId_`, `getCalendarIdForKind_`, `getConfiguredCalendarDescriptors_`, `openCalendarByConfiguredId_` and related helpers. `primary` resolves through `CalendarApp.getDefaultCalendar()`; optional demo/owner IDs remain supported through Script Properties.
+- **`Code.js`** — Added sanitised `health` and `availability` API actions for GET and POST. Availability returns merged busy intervals only and never returns private event titles, descriptions, attendees or event IDs.
+- **`Code.js`** — Added `LockService` protection, overlap detection and `bookingKey` idempotency to `lesson_book_create`. New bookings must be exactly 50 minutes.
+- **`Code.js`** — Added `authorisePrivateCalendarOnce()` and `createBookingApiKeyOnce()` setup helpers.
+- **`tests/private_calendar.test.mjs`** — Added tests for primary-calendar fallback, optional calendar overrides, Japan-day conversion, busy-window merging, conflict detection and idempotent retries.
+- **`.clasp.json.example`** — Added a safe template for a new private Apps Script project.
+
+#### Changed
+- **`Config.js` / calendar configuration**
+  - From: Three hard-coded Green Square shared calendar IDs and three live spreadsheet IDs.
+  - To: `primary` private calendar by default, optional Script Property overrides, and no account-specific IDs in source control.
+- **`Code.js` / API responses**
+  - From: General calendar polling could return event IDs and summaries and depended on Green Square sheet cache helpers.
+  - To: The public backend exposes only authorised health and sanitised busy-window responses; booking actions operate directly on the configured private calendar.
+- **`Code.js` / booking creation**
+  - From: A create request could overlap another event and concurrent requests could create the same slot twice.
+  - To: The request holds a script lock, rechecks the calendar, rejects occupied slots with `SLOT_UNAVAILABLE`, and treats repeated `bookingKey` values as the existing booking.
+- **`README.md`**
+  - From: Instructions for deploying the Green Square webhook and registering three calendar watches.
+  - To: Isolated private-project setup, Script Property configuration, Cloudflare-to-GAS architecture and complete API examples.
+- **`appsscript.json`**
+  - From: Automatically inferred permissions from calendar, spreadsheet and legacy integration code.
+  - To: Explicit calendar-only OAuth scope.
+
+#### Removed
+- **`.clasp.json`** — Removed the tracked Green Square Apps Script project ID and ignored local `.clasp.json` files to prevent an accidental push to the existing deployment.
+- **`Functions.js`, `MonthlyCache.js`, `LESSON_CLASSIFICATION.md`** — Removed Green Square spreadsheet caching, staff polling and lesson-classification code from this isolated private-calendar branch.
+- **`Code.js`** — Removed calendar-watch registration, contact synchronisation and legacy spreadsheet refresh paths.
+
+#### Validation
+- `node --check Code.js Config.js PrivateCalendar.js`
+- `node tests/lesson_book_delete.test.mjs` — 14 tests passed
+- `node tests/private_calendar.test.mjs` — 8 tests passed
+- `jq empty appsscript.json`
+- `git diff --check`
+
+---
+
 ## Unreleased
 
 ### Changed
