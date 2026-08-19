@@ -9,6 +9,13 @@ var _CALENDAR_IDS = [
   'c_403306dccf2039f61a620a4cfc22424c5a6f79e945054e57f30ecc50c90b9207@group.calendar.google.com'
 ];
 
+// The React Admin asks GAS for current + next month on load and every polling interval.
+// Cache those processed month payloads across Apps Script executions so repeated reads do not
+// rescan all three Google Calendars. The schedule version is part of the key, so webhook/booking
+// syncs invalidate old data immediately when bumpScheduleCacheVersion() runs.
+var MONTH_API_CACHE_PREFIX_ = 'calendar-month-v2-';
+var MONTH_API_CACHE_TTL_SECONDS_ = 600;
+
 function toYYYYMM(dateOrString) {
   if (!dateOrString) return '';
   if (dateOrString instanceof Date) {
@@ -210,6 +217,8 @@ function cacheEventsToSheet(monthStr, sheetName) {
 
   Logger.log('Caching events for month: ' + monthStr + ' to sheet: ' + sheetName);
 
+  // This is intentionally a fresh Calendar read. The sheet cache is the source used to bump
+  // schedule version, so it must never be rebuilt from a possibly stale month API cache.
   var events = getAllEventsForMonth(monthStr);
   if (!events || !Array.isArray(events)) events = [];
   Logger.log('Retrieved ' + events.length + ' events from 3 calendars for ' + monthStr);
@@ -230,7 +239,8 @@ function cacheEventsToSheet(monthStr, sheetName) {
   if (!cacheSheet) {
     cacheSheet = ss.insertSheet(sheetName);
   } else {
-    cacheSheet.clear();
+    // Preserve formatting and avoid the heavier clear() operation.
+    cacheSheet.clearContents();
   }
 
   var headers = [
@@ -246,8 +256,8 @@ function cacheEventsToSheet(monthStr, sheetName) {
     'LessonKind',
     'AwaitingRescheduleDate'
   ];
-  cacheSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-  cacheSheet.getRange(2, 1, validRows.length, headers.length).setValues(validRows);
+  var output = [headers].concat(validRows);
+  cacheSheet.getRange(1, 1, output.length, headers.length).setValues(output);
 
   return validRows.length;
 }
@@ -303,17 +313,80 @@ function rowsToPollingFormat(rows) {
   return out;
 }
 
+function encodeMonthApiCache_(payload) {
+  var json = JSON.stringify(payload);
+  try {
+    var zipped = Utilities.gzip(Utilities.newBlob(json, 'application/json'));
+    return 'gz:' + Utilities.base64EncodeWebSafe(zipped.getBytes());
+  } catch (e) {
+    return 'json:' + json;
+  }
+}
+
+function decodeMonthApiCache_(encoded) {
+  if (!encoded) return null;
+  try {
+    if (encoded.indexOf('gz:') === 0) {
+      var bytes = Utilities.base64DecodeWebSafe(encoded.substring(3));
+      return JSON.parse(Utilities.ungzip(Utilities.newBlob(bytes)).getDataAsString('UTF-8'));
+    }
+    if (encoded.indexOf('json:') === 0) return JSON.parse(encoded.substring(5));
+    return JSON.parse(encoded);
+  } catch (e) {
+    return null;
+  }
+}
+
+function currentScheduleVersionForMonthCache_() {
+  try {
+    if (typeof getScheduleCacheState === 'function') {
+      return Number(getScheduleCacheState().cacheVersion || 0);
+    }
+  } catch (e) {}
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty('SCHEDULE_CACHE_VERSION');
+    var parsed = parseInt(raw || '0', 10);
+    return isNaN(parsed) ? 0 : parsed;
+  } catch (e) {
+    return 0;
+  }
+}
+
 /**
  * Fetch schedule data for a specific month directly from Calendar (for retroactive backfill).
+ * Current/next-month requests are also the React Admin hot path, so cache the processed JSON
+ * between schedule-version changes. A cache miss still returns the same Calendar-derived data.
  * @param {string} monthStr - YYYY-MM
  * @returns {{ data: Array, month: string }}
  */
 function getScheduleDataForMonth(monthStr) {
   var yyyymm = toYYYYMM(monthStr);
   if (!yyyymm) return { data: [], month: '' };
-  var events = getAllEventsForMonth(monthStr);
+
+  var version = currentScheduleVersionForMonthCache_();
+  var cacheKey = MONTH_API_CACHE_PREFIX_ + String(version) + '-' + yyyymm;
+  var cache = CacheService.getScriptCache();
+
+  try {
+    var cached = decodeMonthApiCache_(cache.get(cacheKey));
+    if (cached && cached.month === yyyymm && Array.isArray(cached.data)) {
+      return cached;
+    }
+  } catch (e) {}
+
+  var events = getAllEventsForMonth(yyyymm);
   var rows = processEventsForMonth(events);
-  return { data: rowsToPollingFormat(rows), month: yyyymm };
+  var result = { data: rowsToPollingFormat(rows), month: yyyymm };
+
+  try {
+    var encoded = encodeMonthApiCache_(result);
+    // CacheService has a ~100 KB per-key value limit. Skip cache rather than fail the request.
+    if (encoded.length < 95000) {
+      cache.put(cacheKey, encoded, MONTH_API_CACHE_TTL_SECONDS_);
+    }
+  } catch (e) {}
+
+  return result;
 }
 
 /**
@@ -374,7 +447,7 @@ function cacheYearToSheet(year) {
   var ss = SpreadsheetApp.openById(adminSsId);
   var cacheSheet = ss.getSheetByName('MonthlySchedule');
   if (!cacheSheet) cacheSheet = ss.insertSheet('MonthlySchedule');
-  else cacheSheet.clear();
+  else cacheSheet.clearContents();
   var headers = [
     'EventID',
     'Title',
@@ -388,10 +461,8 @@ function cacheYearToSheet(year) {
     'LessonKind',
     'AwaitingRescheduleDate'
   ];
-  cacheSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-  if (rows.length > 0) {
-    cacheSheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
-  }
+  var output = [headers].concat(rows);
+  cacheSheet.getRange(1, 1, output.length, headers.length).setValues(output);
   bumpScheduleCacheVersion();
   Logger.log('cacheYearToSheet: stored ' + rows.length + ' rows for year ' + year + ' (' + (result.months || []).length + ' months)');
   return { rows: rows.length, months: result.months || [] };
@@ -432,6 +503,7 @@ function cacheMonthlyEventsForBothMonths() {
   Logger.log('=== Monthly cache operation completed ===');
   return results;
 }
+
 function debugCalendarAccess() {
   var ranges = [
     { label: '2025-01', start: new Date(2025, 0, 1), end: new Date(2025, 1, 1) },
