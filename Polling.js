@@ -1,12 +1,14 @@
 /**
- * Polling.js — Read the cached MonthlySchedule for the React/Admin polling API.
+ * Polling.js — MonthlySchedule polling support for Code.js.
  *
- * The schedule itself is still persisted in Google Sheets. The hot polling path is backed by
- * CacheService and a Script Properties cache-version so repeated GET requests do not reopen and
- * reread MonthlySchedule until the webhook sync bumps the schedule version.
+ * Hot-path design:
+ * - Script Properties hold schedule version metadata, avoiding a Sheet read on every poll.
+ * - CacheService holds the processed current-month payload between version changes.
+ * - MonthlySchedule is read only on cache miss.
+ * - Previous row keys are stored compressed/chunked in Script Properties for removed-event diffs.
  */
 
-var POLL_PAYLOAD_CACHE_PREFIX_ = 'schedule-poll-v2-';
+var POLL_PAYLOAD_CACHE_PREFIX_ = 'schedule-poll-v3-';
 var POLL_PAYLOAD_CACHE_TTL_SECONDS_ = 600;
 var SCHEDULE_CACHE_VERSION_PROPERTY_ = 'SCHEDULE_CACHE_VERSION';
 var SCHEDULE_CACHE_UPDATED_PROPERTY_ = 'SCHEDULE_CACHE_LAST_UPDATED';
@@ -26,8 +28,8 @@ function getOrCreateScheduleCacheStateSheet_(ss) {
 }
 
 /**
- * Get schedule cache state. Script Properties are the hot path; the sheet is only a fallback for
- * first run / migration from the previous implementation.
+ * Read schedule version metadata. Script Properties are the normal hot path; the sheet is only
+ * used as a migration/fallback source when the properties have not yet been initialised.
  */
 function getScheduleCacheState() {
   var props = PropertiesService.getScriptProperties();
@@ -57,10 +59,10 @@ function getScheduleCacheState() {
     }
   } catch (e) {}
 
-  var stateProps = {};
-  stateProps[SCHEDULE_CACHE_VERSION_PROPERTY_] = String(version);
-  stateProps[SCHEDULE_CACHE_UPDATED_PROPERTY_] = lastUpdated;
-  props.setProperties(stateProps, false);
+  var updates = {};
+  updates[SCHEDULE_CACHE_VERSION_PROPERTY_] = String(version);
+  updates[SCHEDULE_CACHE_UPDATED_PROPERTY_] = lastUpdated;
+  props.setProperties(updates, false);
 
   return { cacheVersion: version, lastUpdated: lastUpdated };
 }
@@ -70,8 +72,8 @@ function getScheduleCacheVersion_() {
 }
 
 /**
- * Called after MonthlySchedule has been rebuilt. The new version changes the CacheService key, so
- * polling immediately stops using the old snapshot without needing to scan/delete cache entries.
+ * Bump the schedule version after a fresh Calendar -> MonthlySchedule sync.
+ * Versioned cache keys make old poll/month payloads unreachable immediately.
  */
 function bumpScheduleCacheVersion() {
   var lock = LockService.getScriptLock();
@@ -84,11 +86,14 @@ function bumpScheduleCacheVersion() {
     var nextVersion = previousVersion + 1;
     var lastUpdated = new Date().toISOString();
 
-    var nextProps = {};
-    nextProps[SCHEDULE_CACHE_VERSION_PROPERTY_] = String(nextVersion);
-    nextProps[SCHEDULE_CACHE_UPDATED_PROPERTY_] = lastUpdated;
-    PropertiesService.getScriptProperties().setProperties(nextProps, false);
+    var props = PropertiesService.getScriptProperties();
+    var updates = {};
+    updates[SCHEDULE_CACHE_VERSION_PROPERTY_] = String(nextVersion);
+    updates[SCHEDULE_CACHE_UPDATED_PROPERTY_] = lastUpdated;
+    props.setProperties(updates, false);
 
+    // Keep the existing sheet state for visibility/backwards compatibility, but do not depend on
+    // it for normal reads.
     try {
       var ss = SpreadsheetApp.openById(ADMIN_SS_ID);
       var sheet = getOrCreateScheduleCacheStateSheet_(ss);
@@ -117,10 +122,8 @@ function pollingMonthFromValue_(value, tz) {
   if (!s) return '';
   if (/^\d{4}-\d{2}/.test(s)) return s.substring(0, 7);
   try {
-    if (typeof toYYYYMM === 'function') {
-      var parsed = toYYYYMM(s);
-      if (parsed) return parsed;
-    }
+    var parsed = toYYYYMM(s);
+    if (parsed) return parsed;
   } catch (e) {}
   var d = new Date(s);
   if (!isNaN(d.getTime())) return Utilities.formatDate(d, tz, 'yyyy-MM');
@@ -140,10 +143,7 @@ function pollingDateString_(value, tz, fallbackDate) {
   return s;
 }
 
-/**
- * Read MonthlySchedule once and convert it to the JSON shape used by Code.js polling.
- * Only the current month is returned, matching the pre-existing polling contract.
- */
+/** Read only the used MonthlySchedule range and emit the current month. */
 function readScheduleSheetsForPolling() {
   var ss = SpreadsheetApp.openById(ADMIN_SS_ID);
   var sheet = ss.getSheetByName('MonthlySchedule');
@@ -183,7 +183,7 @@ function readScheduleSheetsForPolling() {
 
     var dateString = dateValue instanceof Date && !isNaN(dateValue.getTime())
       ? Utilities.formatDate(dateValue, tz, 'yyyy-MM-dd')
-      : String(dateValue || '').trim();
+      : String(dateValue || '').trim().substring(0, 10);
     var kind = String(row[iKind] || 'regular').trim().toLowerCase();
     if (kind !== 'regular' && kind !== 'demo' && kind !== 'owner') kind = 'regular';
 
@@ -207,14 +207,14 @@ function readScheduleSheetsForPolling() {
       item.awaitingRescheduleDate = false;
     }
 
-    out.push(item);
+    if (item.eventID && item.studentName) out.push(item);
   });
 
   return out;
 }
 
-function encodePollingPayloadForCache_(payload) {
-  var json = JSON.stringify(payload);
+function encodePollingValue_(value) {
+  var json = JSON.stringify(value);
   try {
     var zipped = Utilities.gzip(Utilities.newBlob(json, 'application/json'));
     return 'gz:' + Utilities.base64EncodeWebSafe(zipped.getBytes());
@@ -223,8 +223,8 @@ function encodePollingPayloadForCache_(payload) {
   }
 }
 
-function decodePollingPayloadFromCache_(encoded) {
-  if (!encoded) return null;
+function decodePollingValue_(encoded, fallback) {
+  if (!encoded) return fallback;
   try {
     if (encoded.indexOf('gz:') === 0) {
       var bytes = Utilities.base64DecodeWebSafe(encoded.substring(3));
@@ -233,20 +233,18 @@ function decodePollingPayloadFromCache_(encoded) {
     if (encoded.indexOf('json:') === 0) return JSON.parse(encoded.substring(5));
     return JSON.parse(encoded);
   } catch (e) {
-    return null;
+    return fallback;
   }
 }
 
-/**
- * Polling hot path. On a cache hit this performs no SpreadsheetApp calls.
- */
+/** On a cache hit this performs no SpreadsheetApp calls. */
 function getScheduleDataForPolling() {
   var state = getScheduleCacheState();
   var cacheKey = POLL_PAYLOAD_CACHE_PREFIX_ + String(state.cacheVersion || 0);
   var cache = CacheService.getScriptCache();
 
   try {
-    var cached = decodePollingPayloadFromCache_(cache.get(cacheKey));
+    var cached = decodePollingValue_(cache.get(cacheKey), null);
     if (cached && Array.isArray(cached.data)) return cached;
   } catch (e) {}
 
@@ -257,9 +255,7 @@ function getScheduleDataForPolling() {
   };
 
   try {
-    var encoded = encodePollingPayloadForCache_(payload);
-    // CacheService values are limited to roughly 100 KB. Skip caching unusually large payloads
-    // rather than failing the request; gzip keeps normal current-month payloads comfortably below it.
+    var encoded = encodePollingValue_(payload);
     if (encoded.length < 95000) {
       cache.put(cacheKey, encoded, POLL_PAYLOAD_CACHE_TTL_SECONDS_);
     }
@@ -268,15 +264,20 @@ function getScheduleDataForPolling() {
   return payload;
 }
 
+/**
+ * Canonical recurring-safe removed key expected by REACT-ADMIN:
+ * eventID|studentName|YYYY-MM-DD when date exists, otherwise legacy eventID|studentName.
+ */
 function rowKeyFromLessonRow_(row) {
   var r = row || {};
-  return [
-    String(r.eventID || '').trim(),
-    String(r.date || '').trim(),
-    String(r.start || '').trim(),
-    String(r.studentName || '').trim(),
-    String(r.lessonKind || 'regular').trim()
-  ].join('|');
+  var eventID = String(r.eventID || '').trim();
+  var studentName = String(r.studentName || '').trim();
+  var date = String(r.date || '').trim().substring(0, 10);
+  if (!eventID || !studentName) return '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return eventID + '|' + studentName + '|' + date;
+  }
+  return eventID + '|' + studentName;
 }
 
 function lessonKeysFromData_(data) {
@@ -291,36 +292,6 @@ function lessonKeysFromData_(data) {
   return out.sort();
 }
 
-function encodePreviousPollKeys_(keys) {
-  var json = JSON.stringify(Array.isArray(keys) ? keys : []);
-  try {
-    var zipped = Utilities.gzip(Utilities.newBlob(json, 'application/json'));
-    return 'gz:' + Utilities.base64EncodeWebSafe(zipped.getBytes());
-  } catch (e) {
-    return 'json:' + json;
-  }
-}
-
-function decodePreviousPollKeys_(encoded) {
-  if (!encoded) return [];
-  try {
-    if (encoded.indexOf('gz:') === 0) {
-      var bytes = Utilities.base64DecodeWebSafe(encoded.substring(3));
-      var json = Utilities.ungzip(Utilities.newBlob(bytes)).getDataAsString('UTF-8');
-      var parsed = JSON.parse(json);
-      return Array.isArray(parsed) ? parsed : [];
-    }
-    if (encoded.indexOf('json:') === 0) {
-      var parsedJson = JSON.parse(encoded.substring(5));
-      return Array.isArray(parsedJson) ? parsedJson : [];
-    }
-    var legacy = JSON.parse(encoded);
-    return Array.isArray(legacy) ? legacy : [];
-  } catch (e) {
-    return [];
-  }
-}
-
 function loadPreviousPollKeys_() {
   var props = PropertiesService.getScriptProperties();
   var count = parseInt(props.getProperty(POLL_PREVIOUS_KEYS_CHUNK_COUNT_PROPERTY_) || '0', 10);
@@ -329,16 +300,17 @@ function loadPreviousPollKeys_() {
     for (var i = 0; i < count; i++) {
       encoded += props.getProperty(POLL_PREVIOUS_KEYS_CHUNK_PREFIX_ + i) || '';
     }
-    return decodePreviousPollKeys_(encoded);
+    var parsed = decodePollingValue_(encoded, []);
+    return Array.isArray(parsed) ? parsed : [];
   }
 
-  // Backwards compatibility with the original single-property implementation.
-  return decodePreviousPollKeys_(props.getProperty(POLL_PREVIOUS_KEYS_PROPERTY_) || '[]');
+  var legacy = decodePollingValue_(props.getProperty(POLL_PREVIOUS_KEYS_PROPERTY_) || '[]', []);
+  return Array.isArray(legacy) ? legacy : [];
 }
 
 function savePreviousPollKeysFromData_(data) {
   var props = PropertiesService.getScriptProperties();
-  var encoded = encodePreviousPollKeys_(lessonKeysFromData_(data));
+  var encoded = encodePollingValue_(lessonKeysFromData_(data));
   var chunkSize = 7000;
   var chunks = [];
   for (var pos = 0; pos < encoded.length; pos += chunkSize) {
