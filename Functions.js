@@ -3,6 +3,9 @@
  * Config (SS_ID, CALENDAR_ID, etc.) in Config.js — files are merged into one scope.
  */
 
+var STUDENT_FOLDER_MAP_CACHE_KEY_ = 'student-folder-map-v2';
+var STUDENT_FOLDER_MAP_CACHE_TTL_SECONDS_ = 120;
+
 function getOrCreateAppStateSheet(ss) {
   let sheet = ss.getSheetByName(APPSTATE_SHEET_NAME);
   if (!sheet) {
@@ -13,29 +16,25 @@ function getOrCreateAppStateSheet(ss) {
   return sheet;
 }
 
-function getLessonsTodayFingerprint() {
-  const ss = SpreadsheetApp.openById(SS_ID);
-  const sheet = ss.getSheetByName('lessons_today');
-  if (!sheet) return '';
-  const data = sheet.getDataRange().getValues();
-  if (data.length < 2) return '';
+function fingerprintLessonsTodayData_(data) {
+  if (!Array.isArray(data) || data.length < 2) return '';
   const rows = data.slice(1);
   const parts = rows
-    .map(r => r.map(cell => String(cell ?? '').trim()).join('|'))
+    .map(r => r.map(cell => String(cell == null ? '' : cell).trim()).join('|'))
     .sort();
   return parts.join(',');
 }
 
-function getLessonsTodayStatuses() {
-  const SHEET_NAME = 'lessons_today';
+function getLessonsTodayFingerprint() {
   const ss = SpreadsheetApp.openById(SS_ID);
-  const sheet = ss.getSheetByName(SHEET_NAME);
-  if (!sheet) throw new Error(`Sheet "${SHEET_NAME}" not found.`);
+  const sheet = ss.getSheetByName('lessons_today');
+  if (!sheet) return '';
+  return fingerprintLessonsTodayData_(sheet.getDataRange().getValues());
+}
 
-  const data = sheet.getDataRange().getValues();
-  if (data.length < 2) return [];
-
-  const headers = data.shift().map(h => h.toString().trim());
+function statusesFromLessonsTodayData_(data) {
+  if (!Array.isArray(data) || data.length < 2) return [];
+  const headers = data[0].map(h => String(h).trim());
   const idxID = headers.indexOf('eventID');
   const idxPDF = headers.indexOf('pdfUpload');
   const idxLH = headers.indexOf('lessonHistory');
@@ -44,16 +43,65 @@ function getLessonsTodayStatuses() {
     throw new Error('Missing one of eventID, pdfUpload or lessonHistory headers.');
   }
 
-  return data.map(row => {
-    const pdf = String(row[idxPDF]).toLowerCase() === 'true';
-    const lh = String(row[idxLH]).toLowerCase() === 'true';
-    return {
-      eventID: String(row[idxID]),
-      pdfUpload: pdf,
-      lessonHistory: lh,
-      folderName: idxFolder >= 0 ? String(row[idxFolder] || '') : ''
-    };
-  });
+  return data.slice(1).map(row => ({
+    eventID: String(row[idxID] || ''),
+    pdfUpload: String(row[idxPDF]).toLowerCase() === 'true',
+    lessonHistory: String(row[idxLH]).toLowerCase() === 'true',
+    folderName: idxFolder >= 0 ? String(row[idxFolder] || '') : ''
+  }));
+}
+
+function getLessonsTodayStatuses() {
+  const SHEET_NAME = 'lessons_today';
+  const ss = SpreadsheetApp.openById(SS_ID);
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) throw new Error(`Sheet "${SHEET_NAME}" not found.`);
+  return statusesFromLessonsTodayData_(sheet.getDataRange().getValues());
+}
+
+/**
+ * Build the Student List name -> folder map. CacheService persists across Apps Script web
+ * executions, unlike a normal global variable, so repeated webhook/API calls avoid rereading
+ * the whole Student List sheet.
+ */
+function getStudentFolderMap_() {
+  const cache = CacheService.getScriptCache();
+  try {
+    const cached = cache.get(STUDENT_FOLDER_MAP_CACHE_KEY_);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (parsed && typeof parsed === 'object') return parsed;
+    }
+  } catch (e) {}
+
+  const studentMap = {};
+  try {
+    const studentSs = getStudentListSpreadsheet_();
+    const studentSheet = studentSs && studentSs.getSheetByName('Student List');
+    if (studentSheet) {
+      const lastRow = studentSheet.getLastRow();
+      if (lastRow > 1) {
+        // Only columns C:D are needed (student name and folder), rather than the whole sheet.
+        const studentData = studentSheet.getRange(2, 3, lastRow - 1, 2).getValues();
+        for (let i = 0; i < studentData.length; i++) {
+          const name = studentData[i][0];
+          const folder = studentData[i][1];
+          if (name && folder) studentMap[String(name).trim()] = String(folder).trim();
+        }
+      }
+    }
+  } catch (e) {
+    Logger.log('getStudentFolderMap_ failed: ' + String(e));
+  }
+
+  try {
+    cache.put(STUDENT_FOLDER_MAP_CACHE_KEY_, JSON.stringify(studentMap), STUDENT_FOLDER_MAP_CACHE_TTL_SECONDS_);
+  } catch (e) {}
+  return studentMap;
+}
+
+function clearStudentFolderMapCache_() {
+  try { CacheService.getScriptCache().remove(STUDENT_FOLDER_MAP_CACHE_KEY_); } catch (e) {}
 }
 
 function getLessonStatus_(event) {
@@ -91,9 +139,8 @@ function changeEventColor(eventID, color) {
     if (event) {
       event.setColor(color);
       return { success: true, message: 'Event color updated successfully' };
-    } else {
-      throw new Error('Event not found in any calendar');
     }
+    throw new Error('Event not found in any calendar');
   } catch (error) {
     Logger.log('Error changing event color: ' + error.message);
     return { success: false, message: error.message };
@@ -103,6 +150,14 @@ function changeEventColor(eventID, color) {
 /**
  * Fetches all lesson & demo events for today (or a specific date) from calendars,
  * preserves existing pdfUpload and lessonHistory flags, and writes to 'lessons_today'.
+ *
+ * Performance notes:
+ * - opens Teacher Admin only once per sync;
+ * - reads lessons_today once and reuses that snapshot for fingerprint + old status data;
+ * - reads only Student List columns C:D and caches that map across executions;
+ * - computes the post-write fingerprint in memory instead of rereading the sheet;
+ * - writes the header + rows in one setValues call.
+ *
  * @param {string=} dateOverride Optional "DD/MM/YYYY" string.
  * @returns {Array<Object>} Array of grouped lesson objects written to sheet.
  */
@@ -111,20 +166,21 @@ function fetchAndCacheTodayLessons(dateOverride) {
   const ss = SpreadsheetApp.openById(SS_ID);
   const tz = Session.getScriptTimeZone();
 
-  let beforeFingerprint = '';
-  try { beforeFingerprint = getLessonsTodayFingerprint(); } catch (e) {}
+  let targetSheet = ss.getSheetByName('lessons_today');
+  const existingData = targetSheet ? targetSheet.getDataRange().getValues() : [];
+  const beforeFingerprint = fingerprintLessonsTodayData_(existingData);
 
   let penultimateEvalDue = false;
+  let appStateSheet = null;
   try {
-    const appStateSheet = getOrCreateAppStateSheet(ss);
+    appStateSheet = getOrCreateAppStateSheet(ss);
     const b5 = appStateSheet.getRange(5, 2).getValue();
     penultimateEvalDue = (b5 === true || String(b5).toLowerCase() === 'true');
   } catch (e) {}
 
   const oldStatusMap = {};
   try {
-    const existingStatuses = getLessonsTodayStatuses();
-    existingStatuses.forEach(status => {
+    statusesFromLessonsTodayData_(existingData).forEach(status => {
       oldStatusMap[status.eventID] = {
         pdfUpload: status.pdfUpload,
         lessonHistory: status.lessonHistory,
@@ -164,18 +220,9 @@ function fetchAndCacheTodayLessons(dateOverride) {
   eventsDemo.forEach(e => allEvents.push({ event: e, calendarType: 'demo' }));
   eventsOwner.forEach(e => allEvents.push({ event: e, calendarType: 'owner' }));
 
-  const studentMap = {};
-  const studentSheet = STUDENTLIST.getSheetByName('Student List');
-  if (studentSheet) {
-    const studentData = studentSheet.getDataRange().getValues();
-    for (let i = 1; i < studentData.length; i++) {
-      const name = studentData[i][2];
-      const folder = studentData[i][3];
-      if (name && folder) studentMap[name] = folder;
-    }
-  }
-
+  const studentMap = getStudentFolderMap_();
   const flat = [];
+
   allEvents.forEach(({ event, calendarType }) => {
     const title = event.getTitle();
     if (/break/i.test(title) || /teacher/i.test(title)) return;
@@ -202,9 +249,13 @@ function fetchAndCacheTodayLessons(dateOverride) {
     const teacherMatch = description.match(/#teacher(\w+)/i);
     const teacher = teacherMatch ? teacherMatch[1] : '';
 
+    // We already have the CalendarEvent object. Calling changeEventColor(eventId) would look the
+    // same event up again across up to three calendars, so update it directly here.
     if (lessonStatus === null) {
-      if (hasEvaluationReady) changeEventColor(event.getId(), 'green');
-      else if (hasEvaluationDue) changeEventColor(event.getId(), 'red');
+      try {
+        if (hasEvaluationReady) event.setColor('green');
+        else if (hasEvaluationDue) event.setColor('red');
+      } catch (e) {}
     }
 
     let sharedLastName = '';
@@ -223,10 +274,10 @@ function fetchAndCacheTodayLessons(dateOverride) {
       }
     }
 
-    cleanNames.forEach((nm) => {
+    cleanNames.forEach(nm => {
       const parts = nm.split(/\s+/);
       const fullName = (parts.length === 1 && sharedLastName) ? (parts[0] + ' ' + sharedLastName) : nm;
-      let cleanStudentName = fullName.trim();
+      const cleanStudentName = fullName.trim();
       let folderName = studentMap[cleanStudentName] || '';
       if (/D\/L/i.test(title)) folderName = cleanStudentName + ' DEMO';
       const isOnline = /\(\s*(Cafe|Online)\s*\)/i.test(title);
@@ -244,7 +295,7 @@ function fetchAndCacheTodayLessons(dateOverride) {
         isOnline: isOnline,
         status: status,
         teacher: teacher,
-        calendarType: calendarType,
+        calendarType: calendarType
       });
     });
   });
@@ -265,7 +316,7 @@ function fetchAndCacheTodayLessons(dateOverride) {
         evaluationDue: item.evaluationDue,
         status: item.status,
         teacher: item.teacher,
-        calendarType: item.calendarType,
+        calendarType: item.calendarType
       };
     } else {
       grouped[item.eventID].studentNames.push(item.studentName);
@@ -293,12 +344,8 @@ function fetchAndCacheTodayLessons(dateOverride) {
     return [];
   }
 
-  let tgt = ss.getSheetByName('lessons_today');
-  if (!tgt) {
-    tgt = ss.insertSheet('lessons_today');
-  } else {
-    tgt.clearContents();
-  }
+  if (!targetSheet) targetSheet = ss.insertSheet('lessons_today');
+  else targetSheet.clearContents();
 
   const headers = [
     'eventID', 'eventName', 'Start', 'End',
@@ -306,25 +353,23 @@ function fetchAndCacheTodayLessons(dateOverride) {
     'evaluationReady', 'evaluationDue', 'isOnline', 'status', 'teacher',
     'calendarType'
   ];
-  tgt.getRange(1, 1, 1, headers.length).setValues([headers]);
 
-  if (lessons.length) {
-    const out = lessons.map(l => [
-      l.eventID, l.eventName, l.Start, l.End,
-      l.folderName, l.studentNames.join(', '), l.pdfUpload, l.lessonHistory,
-      l.evaluationReady || false, l.evaluationDue || false, l.isOnline || false,
-      l.status || 'regular', l.teacher || '', l.calendarType || ''
-    ]);
-    tgt.getRange(2, 1, out.length, headers.length).setValues(out);
-  }
+  const out = lessons.map(l => [
+    l.eventID, l.eventName, l.Start, l.End,
+    l.folderName, l.studentNames.join(', '), l.pdfUpload, l.lessonHistory,
+    l.evaluationReady || false, l.evaluationDue || false, l.isOnline || false,
+    l.status || 'regular', l.teacher || '', l.calendarType || ''
+  ]);
 
-  const afterFingerprint = getLessonsTodayFingerprint();
+  const nextSheetData = [headers].concat(out);
+  targetSheet.getRange(1, 1, nextSheetData.length, headers.length).setValues(nextSheetData);
+
+  const afterFingerprint = fingerprintLessonsTodayData_(nextSheetData);
   if (beforeFingerprint !== afterFingerprint) {
-    const appState = getOrCreateAppStateSheet(ss);
-    const current = appState.getRange(2, 1).getValue();
+    if (!appStateSheet) appStateSheet = getOrCreateAppStateSheet(ss);
+    const current = appStateSheet.getRange(2, 1).getValue();
     const next = (typeof current === 'number' ? current : 0) + 1;
-    appState.getRange(2, 1).setValue(next);
-    appState.getRange(2, 2).setValue(new Date().toISOString());
+    appStateSheet.getRange(2, 1, 1, 2).setValues([[next, new Date().toISOString()]]);
   }
 
   Logger.log('--- fetchAndCacheTodayLessons END ---');
