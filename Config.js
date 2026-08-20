@@ -1,27 +1,14 @@
 /**
- * Config.js — All shared constants. Apps Script merges files into one scope, so declare once here.
+ * Config.js — Student Number Tag API only.
  *
- * Secrets: do not put real API keys in Git. Set BOOKING_API_KEY (and POLL_API_KEY, etc.) in
- * Project Settings → Script properties, or run migratePropertiesFromConfig_() once after pasting
- * values locally only. WEBHOOK_URL: paste from Deploy after publishing the web app.
+ * Keep the API key out of Git. Set STUDENT_NUMBER_TAG_API_KEY in
+ * Apps Script → Project Settings → Script properties.
+ *
+ * Calendar IDs are inherited from Green Square's existing calendarAPI routing.
  */
 
-// Webhook
-var WEBHOOK_URL = '';
-var WEBHOOK_LOG_SHEET = 'WebhookLog';
-var BOOKING_API_KEY = '';
+var STUDENT_NUMBER_TAG_API_KEY = '';
 
-// Spreadsheets
-var SS_ID = '1nAxTJVh45mc6N9tX2Xr_B4DGQ-fG3s0LTp7eY4sacVo'; // Teacher Admin — lessons_today, AppState, WebhookLog
-var STUDENTLIST_SS_ID = '1IobCrDaNAPquEX0WKR8fLyh0p-Q9XutIdHHuu_3XXEg'; // Student List sheet
-var ADMIN_SS_ID = '1upKC-iNWs7HIeKiVVAegve5O5WbNebbjMlveMcvnuow'; // Admin — MonthlySchedule, NextMonthSchedule
-
-// Calendars
 var CALENDAR_ID = 'greensquare.jp_h8u0oufn8feana384v67o46o78@group.calendar.google.com';
 var DEMO_CALENDAR_ID = 'greensquare.jp_1m1bhvfu9mtts7gq9s9jsj9kbk@group.calendar.google.com';
 var OWNER_CALENDAR_ID = 'c_403306dccf2039f61a620a4cfc22424c5a6f79e945054e57f30ecc50c90b9207@group.calendar.google.com';
-
-// Derived (opened once at load)
-var STUDENTLIST = SpreadsheetApp.openById(STUDENTLIST_SS_ID);
-var APPSTATE_SHEET_NAME = 'AppState';
-var SCHEDULE_CACHE_STATE_SHEET = 'ScheduleCacheState';
