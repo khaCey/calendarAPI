@@ -2,6 +2,7 @@ node_modules/
 .env
 *.log
 credentials/
+.clasp.json
 
 # Track .cursor folder (rules, config)
 !.cursor/
