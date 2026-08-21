@@ -1,16 +1,12 @@
 /**
- * Calendar Mirror — isolated from the production Teacher Calendar API.
- *
- * Source of truth: Google Calendar
- * Canonical Sheet mirror: monthlyLessons
- * Derived indexes: student_<ID>
- * Metadata tabs: studentsIndex, syncState, syncAudit
+ * Calendar Mirror for the rebuilt Green Square schedule system.
+ * Google Calendar is the source of truth; this bound spreadsheet is the read mirror.
  */
 
 var MIRROR_MONTHLY_HEADERS_ = [
   'eventKey','calendarSource','googleEventId','recurringEventId','originalStartTime',
   'studentId','studentName','teacherId','teacherName','lessonKind','title','start','end',
-  'date','time','status','location','updatedAt','lastSyncedAt'
+  'date','time','status','location','updatedAt','lastSyncedAt','iCalUID'
 ];
 
 var MIRROR_STUDENTS_INDEX_HEADERS_ = [
@@ -26,26 +22,10 @@ var MIRROR_SYNC_AUDIT_HEADERS_ = [
   'auditId','timestamp','runType','calendarSource','eventsChecked','durationMs','status','errorMessage'
 ];
 
-function getCalendarMirrorSpreadsheetId_() {
-  var fromProps = '';
-  try {
-    fromProps = PropertiesService.getScriptProperties().getProperty('CALENDAR_MIRROR_SPREADSHEET_ID') || '';
-  } catch (ignore) {}
-  if (String(fromProps).trim()) return String(fromProps).trim();
-  try {
-    if (typeof CALENDAR_MIRROR_SPREADSHEET_ID !== 'undefined' && CALENDAR_MIRROR_SPREADSHEET_ID) {
-      return String(CALENDAR_MIRROR_SPREADSHEET_ID).trim();
-    }
-  } catch (ignore2) {}
-  return '';
-}
-
 function requireCalendarMirrorSpreadsheet_() {
-  var spreadsheetId = getCalendarMirrorSpreadsheetId_();
-  if (!spreadsheetId) {
-    throw new Error('CALENDAR_MIRROR_SPREADSHEET_ID is not configured in Script Properties');
-  }
-  return SpreadsheetApp.openById(spreadsheetId);
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) throw new Error('This Apps Script must be attached to the Calendar Mirror spreadsheet');
+  return ss;
 }
 
 function calendarMirrorSources_() {
@@ -80,17 +60,20 @@ function mirrorMonthBounds_(monthText) {
   var value = String(monthText || '').trim();
   if (!value) value = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM');
   if (!/^\d{4}-\d{2}$/.test(value)) throw new Error('month must be YYYY-MM');
+
   var parts = value.split('-');
   var year = Number(parts[0]);
   var month = Number(parts[1]);
   if (month < 1 || month > 12) throw new Error('month must be YYYY-MM');
+
+  // Midnight JST represented in UTC.
   var start = new Date(Date.UTC(year, month - 1, 1, -9, 0, 0));
   var end = new Date(Date.UTC(year, month, 1, -9, 0, 0));
   return { month: value, timeMin: start.toISOString(), timeMax: end.toISOString() };
 }
 
 function fetchMirrorSourceEvents_(source, bounds) {
-  var events = [];
+  var out = [];
   var pageToken = null;
   do {
     var params = {
@@ -102,27 +85,27 @@ function fetchMirrorSourceEvents_(source, bounds) {
       timeZone: 'Asia/Tokyo'
     };
     if (pageToken) params.pageToken = pageToken;
+
     var result = Calendar.Events.list(source.id, params);
     var items = (result && result.items) || [];
-    for (var i = 0; i < items.length; i++) events.push(items[i]);
+    for (var i = 0; i < items.length; i++) out.push(items[i]);
     pageToken = result && result.nextPageToken ? result.nextPageToken : null;
   } while (pageToken);
-  return events;
+  return out;
 }
 
 function mirrorEventStartIso_(event) {
-  if (!event || !event.start) return '';
-  return String(event.start.dateTime || event.start.date || '');
+  return event && event.start ? String(event.start.dateTime || event.start.date || '') : '';
 }
 
 function mirrorEventEndIso_(event) {
-  if (!event || !event.end) return '';
-  return String(event.end.dateTime || event.end.date || '');
+  return event && event.end ? String(event.end.dateTime || event.end.date || '') : '';
 }
 
 function mirrorOriginalStartIso_(event) {
-  if (!event || !event.originalStartTime) return '';
-  return String(event.originalStartTime.dateTime || event.originalStartTime.date || '');
+  return event && event.originalStartTime
+    ? String(event.originalStartTime.dateTime || event.originalStartTime.date || '')
+    : '';
 }
 
 function mirrorEventKey_(sourceKey, event) {
@@ -146,6 +129,7 @@ function mirrorStudentNamesFromTitle_(title) {
     .replace(/\[RESCHEDULED\]\s*/gi, '')
     .replace(/子/g, '')
     .trim();
+
   var beforeParen = raw.split('(')[0].trim();
   if (!beforeParen) return [];
   return beforeParen.split(/\s+and\s+/i)
@@ -161,7 +145,7 @@ function normalizeMirrorEvent_(source, event, syncedAtIso) {
   var end = mirrorEventEndIso_(event);
   var date = start ? Utilities.formatDate(new Date(start), 'Asia/Tokyo', 'yyyy-MM-dd') : '';
   var time = start && /T/.test(start) ? Utilities.formatDate(new Date(start), 'Asia/Tokyo', 'HH:mm') : '';
-  var teacherName = source.key === 'owner' ? 'Sham' : mirrorTeacherName_(description);
+
   return {
     eventKey: mirrorEventKey_(source.key, event),
     calendarSource: source.key,
@@ -171,7 +155,7 @@ function normalizeMirrorEvent_(source, event, syncedAtIso) {
     studentId: studentIds.join(','),
     studentName: studentNames.join(' | '),
     teacherId: '',
-    teacherName: teacherName,
+    teacherName: source.key === 'owner' ? 'Sham' : mirrorTeacherName_(description),
     lessonKind: source.lessonKind,
     title: String((event && event.summary) || ''),
     start: start,
@@ -181,7 +165,8 @@ function normalizeMirrorEvent_(source, event, syncedAtIso) {
     status: String((event && event.status) || 'confirmed'),
     location: String((event && event.location) || ''),
     updatedAt: String((event && event.updated) || ''),
-    lastSyncedAt: syncedAtIso
+    lastSyncedAt: syncedAtIso,
+    iCalUID: String((event && event.iCalUID) || '')
   };
 }
 
@@ -282,7 +267,6 @@ function writeFullMirror_(ss, monthlyRows, sourceStats, startedAtMs, syncedAtIso
   };
 }
 
-/** Initial/full mirror sync for one YYYY-MM month. */
 function syncMonthToCalendarMirror(monthText) {
   var startedAtMs = Date.now();
   var bounds = mirrorMonthBounds_(monthText);
@@ -352,7 +336,6 @@ function mirrorRowsFromSheet_(sheet) {
   }).filter(function (row) { return String(row.eventKey || '').trim(); });
 }
 
-/** Persist one already-verified Calendar event into the Sheet mirror. */
 function upsertVerifiedEventIntoCalendarMirror_(calendarId, lessonKind, exactEvent) {
   if (!exactEvent || !exactEvent.id) throw new Error('Exact verified Calendar event is required for mirror upsert');
   var source = mirrorSourceByCalendarId_(calendarId, lessonKind);
@@ -386,7 +369,9 @@ function upsertVerifiedEventIntoCalendarMirror_(calendarId, lessonKind, exactEve
   replaceMirrorSheetRows_(monthlySheet, MIRROR_MONTHLY_HEADERS_, rows.map(mirrorRowArray_));
 
   var affected = {};
-  oldStudentIds.concat(mirrorStudentIdsFromRow_(nextRow)).forEach(function (id) { if (id) affected[id] = true; });
+  oldStudentIds.concat(mirrorStudentIdsFromRow_(nextRow)).forEach(function (id) {
+    if (id) affected[id] = true;
+  });
   var byStudent = mirrorBuildStudentRows_(rows);
   Object.keys(affected).forEach(function (studentId) {
     var sheet = ensureMirrorSheet_(ss, 'student_' + studentId, MIRROR_MONTHLY_HEADERS_);
