@@ -1,14 +1,16 @@
 # Green Square New Calendar Sync / Student Number API
 
-This branch is an **isolated Apps Script project** for the rebuilt Green Square schedule system.
+This branch contains the isolated Calendar-mirror/tagging work for the rebuilt Green Square schedule system.
 
 It does **not** replace or modify the existing production `calendarAPI` used by the Teacher Calendar App. That existing system remains untouched.
 
-The new test flow follows the Calendar Mirror specification:
+The new flow follows the Calendar Mirror specification:
 
 ```text
 Google Calendar
       ↓ background/full sync
+Calendar Mirror Spreadsheet
+      ↓
 monthlyLessons
       ↓
 student_<ID>
@@ -20,13 +22,9 @@ Google Calendar remains the source of truth. Normal preview/read operations use 
 
 ## Spreadsheet mirror
 
-Set this Script Property:
+The Apps Script project is attached to the Calendar Mirror spreadsheet. The code uses that spreadsheet directly via `SpreadsheetApp.getActiveSpreadsheet()`; no spreadsheet ID needs to be configured manually.
 
-```text
-CALENDAR_MIRROR_SPREADSHEET_ID=<spreadsheet ID>
-```
-
-The isolated project creates/uses:
+The mirror contains:
 
 ```text
 monthlyLessons
@@ -40,7 +38,7 @@ student_<ID>
 
 ## Initial fetch
 
-After `clasp push`, run this function from the Apps Script editor:
+After updating the Apps Script code, run:
 
 ```js
 setupCalendarMirrorSpreadsheet()
@@ -96,7 +94,7 @@ Canonical metadata:
 [GS_STUDENT_IDS:123,456]
 ```
 
-The only Calendar mutation exposed by this project is:
+The only Calendar mutation exposed by this work is:
 
 ```js
 Calendar.Events.patch(
@@ -132,7 +130,7 @@ rebuild affected student_<ID> index
 success
 ```
 
-If the mirror is not configured/writable, tagging is refused **before** Calendar is mutated.
+If the bound mirror spreadsheet cannot be accessed/written, tagging is refused **before** Calendar is mutated.
 
 If Calendar succeeds but the mirror write unexpectedly fails, the API reports `MIRROR_WRITE_FAILED` and does not pretend the whole operation succeeded.
 
@@ -163,26 +161,26 @@ The direct Calendar tagging action. Description-only Calendar mutation plus exac
 
 `student_number_tag_preview` is intentionally disabled. Preview/read must use the Sheet mirror.
 
-## Required Script Properties
+## Required Script Property
+
+Only the API secret is required here:
 
 ```text
 STUDENT_NUMBER_TAG_API_KEY=<dedicated secret>
-CALENDAR_MIRROR_SPREADSHEET_ID=<mirror spreadsheet ID>
 ```
 
-## Deployment
+There is no `CALENDAR_MIRROR_SPREADSHEET_ID` setup step.
 
-Do **not** deploy this branch to the existing Apps Script project used by the Teacher Calendar App.
+## Updating the Apps Script
 
-1. Use the separate Apps Script project already created for this branch.
-2. Keep its local `.clasp.json` pointed only at that standalone project.
+1. Use the Apps Script project attached to the Calendar Mirror spreadsheet.
+2. Keep the local `.clasp.json` pointed at that Apps Script project's script ID.
 3. Pull this branch.
 4. Run `clasp push`.
 5. Approve the Calendar + Google Sheets scopes if prompted.
-6. Set the two Script Properties above.
-7. Run `setupCalendarMirrorSpreadsheet()`.
-8. Run `syncCurrentMonthToCalendarMirror()`.
-9. Deploy a **new version** of the existing standalone Web App deployment.
+6. Run `setupCalendarMirrorSpreadsheet()`.
+7. Run `syncCurrentMonthToCalendarMirror()`.
+8. Deploy a new version of the existing Web App deployment if the HTTP actions are being used.
 
 ## Isolation rule
 
