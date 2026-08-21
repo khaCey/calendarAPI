@@ -396,12 +396,44 @@ function upsertVerifiedEventIntoCalendarMirror_(calendarId, lessonKind, exactEve
   };
 }
 
+function mirrorRowMonth_(row) {
+  var rawDate = row && row.date;
+  if (rawDate instanceof Date && !isNaN(rawDate.getTime())) {
+    return Utilities.formatDate(rawDate, 'Asia/Tokyo', 'yyyy-MM');
+  }
+
+  var dateText = String(rawDate || '').trim();
+  var dateMatch = dateText.match(/^(\d{4})-(\d{2})/);
+  if (dateMatch) return dateMatch[1] + '-' + dateMatch[2];
+
+  var rawStart = row && row.start;
+  if (rawStart instanceof Date && !isNaN(rawStart.getTime())) {
+    return Utilities.formatDate(rawStart, 'Asia/Tokyo', 'yyyy-MM');
+  }
+
+  if (rawStart) {
+    var parsedStart = new Date(rawStart);
+    if (!isNaN(parsedStart.getTime())) {
+      return Utilities.formatDate(parsedStart, 'Asia/Tokyo', 'yyyy-MM');
+    }
+  }
+
+  return '';
+}
+
 function readCalendarMirrorMonth(monthText) {
   var bounds = mirrorMonthBounds_(monthText);
   var ss = requireCalendarMirrorSpreadsheet_();
   var sheet = ensureMirrorSheet_(ss, 'monthlyLessons', MIRROR_MONTHLY_HEADERS_);
-  var rows = mirrorRowsFromSheet_(sheet).filter(function (row) {
-    return String(row.date || '').indexOf(bounds.month) === 0;
+  var allRows = mirrorRowsFromSheet_(sheet);
+  var rows = allRows.filter(function (row) {
+    return mirrorRowMonth_(row) === bounds.month;
   });
-  return { ok: true, month: bounds.month, rows: rows };
+  return {
+    ok: true,
+    month: bounds.month,
+    spreadsheetId: ss.getId(),
+    totalMirrorRows: allRows.length,
+    rows: rows
+  };
 }
