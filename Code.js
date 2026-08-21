@@ -11,7 +11,7 @@
  *   [GS_STUDENT_IDS:123,456]
  */
 
-var STUDENT_NUMBER_TAG_API_REVISION = '2026-08-20-v1';
+var STUDENT_NUMBER_TAG_API_REVISION = '2026-08-21-v2-exact-verify';
 var GS_STUDENT_IDS_TAG_RE_ = /\[GS_STUDENT_IDS\s*:\s*([^\]]+)\]/gi;
 var GS_INSTANCE_SUFFIX_RE_ = /_\d{8}T\d{6}Z$/i;
 var GS_DB_SUFFIX_RE_ = /_\d{4}-\d{2}-\d{2}(?:_\d{2}-\d{2}-\d{2})?$/;
@@ -78,7 +78,6 @@ function normalizeStudentIds_(body) {
   for (var i = 0; i < raw.length; i++) {
     var id = String(raw[i] == null ? '' : raw[i]).trim();
     if (!id) continue;
-    // Keep IDs as strings so leading zeroes survive. Reject delimiter/newline injection.
     if (!/^[A-Za-z0-9_-]+$/.test(id)) {
       throw new Error('Invalid student ID: ' + id);
     }
@@ -140,6 +139,10 @@ function sameStringSet_(left, right) {
 
 function canonicalStudentTag_(studentIds) {
   return '[GS_STUDENT_IDS:' + studentIds.join(',') + ']';
+}
+
+function hasExactCanonicalStudentTag_(description, studentIds) {
+  return String(description || '').indexOf(canonicalStudentTag_(studentIds)) !== -1;
 }
 
 /** Replace only the canonical GS tag. Preserve every other description byte as much as possible. */
@@ -278,12 +281,10 @@ function resolveTagTarget_(body) {
   for (var ci = 0; ci < calendars.length; ci++) {
     var calendarId = calendars[ci];
 
-    // Exact API-id lookup first.
     for (var ei = 0; ei < candidates.length; ei++) {
       var event = tryGetEvent_(calendarId, candidates[ei]);
       if (!event) continue;
 
-      // A recurrence master is not safe to mutate when the request represents one lesson occurrence.
       if (event.recurrence && event.recurrence.length) {
         var occurrence = listOccurrenceNear_(calendarId, body, candidates.concat([event.id, event.iCalUID]));
         if (!occurrence) {
@@ -299,7 +300,6 @@ function resolveTagTarget_(body) {
       return { ok: true, calendarId: calendarId, event: event };
     }
 
-    // DB IDs / iCalUIDs may not be directly accepted by Events.get. Search around the exact lesson time.
     var nearby = listOccurrenceNear_(calendarId, body, candidates);
     if (nearby) return { ok: true, calendarId: calendarId, event: nearby };
   }
@@ -331,6 +331,44 @@ function previewStudentNumberTag_(body) {
   };
 }
 
+function verifyExactPatchedEvent_(calendarId, eventId, requestedIds) {
+  var exact;
+  try {
+    exact = Calendar.Events.get(calendarId, eventId);
+  } catch (verifyErr) {
+    return {
+      ok: false,
+      code: 'EXACT_VERIFY_READ_FAILED',
+      error: 'Could not re-read the exact Calendar event after patch: ' + String(verifyErr && verifyErr.message ? verifyErr.message : verifyErr),
+      eventId: String(eventId || '')
+    };
+  }
+
+  var description = String((exact && exact.description) || '');
+  var observedIds = parseStudentIdsFromDescription_(description);
+  var canonicalPresent = hasExactCanonicalStudentTag_(description, requestedIds);
+  var idsMatch = sameStringSet_(observedIds, requestedIds);
+
+  if (!canonicalPresent || !idsMatch) {
+    return {
+      ok: false,
+      code: 'EXACT_DESCRIPTION_VERIFY_FAILED',
+      error: 'Exact Calendar event did not contain the requested canonical student tag after patch',
+      eventId: String((exact && exact.id) || eventId || ''),
+      requestedStudentIds: requestedIds,
+      observedStudentIds: observedIds,
+      canonicalPresent: canonicalPresent
+    };
+  }
+
+  return {
+    ok: true,
+    eventId: String((exact && exact.id) || eventId || ''),
+    description: description,
+    studentIds: observedIds
+  };
+}
+
 function updateStudentNumberTag_(body) {
   var requestedIds;
   try {
@@ -346,16 +384,20 @@ function updateStudentNumberTag_(body) {
   if (!resolved.ok) return resolved;
 
   var event = resolved.event || {};
+  var exactEventId = String(event.id || '');
+  if (!exactEventId) {
+    return { ok: false, code: 'MISSING_RESOLVED_EVENT_ID', error: 'Resolved Calendar event has no event ID' };
+  }
+
   var description = String(event.description || '');
   var existingIds = parseStudentIdsFromDescription_(description);
 
-  // Safety: never overwrite a conflicting existing mapping automatically.
   if (existingIds.length && !sameStringSet_(existingIds, requestedIds)) {
     return {
       ok: false,
       code: 'STUDENT_ID_MISMATCH',
       error: 'Existing Calendar student IDs do not match requested IDs',
-      eventId: String(event.id || ''),
+      eventId: exactEventId,
       existingStudentIds: existingIds,
       requestedStudentIds: requestedIds
     };
@@ -363,39 +405,57 @@ function updateStudentNumberTag_(body) {
 
   var nextDescription = upsertCanonicalStudentTag_(description, requestedIds);
   if (nextDescription === description) {
+    var alreadyVerify = verifyExactPatchedEvent_(resolved.calendarId, exactEventId, requestedIds);
+    if (!alreadyVerify.ok) return alreadyVerify;
     return {
       ok: true,
+      verified: true,
       action: 'student_number_tag_update',
       actionTaken: 'already_tagged',
-      eventId: String(event.id || ''),
-      studentIds: requestedIds
+      eventId: exactEventId,
+      studentIds: requestedIds,
+      description: alreadyVerify.description
     };
   }
 
-  // DESCRIPTION ONLY. Do not send title/start/end/color/recurrence/attendees/location.
   var patched;
   try {
     patched = Calendar.Events.patch(
       { description: nextDescription },
       resolved.calendarId,
-      String(event.id || '')
+      exactEventId
     );
   } catch (patchErr) {
     return {
       ok: false,
       code: 'DESCRIPTION_PATCH_FAILED',
       error: 'Calendar description patch failed: ' + String(patchErr && patchErr.message ? patchErr.message : patchErr),
-      eventId: String(event.id || '')
+      eventId: exactEventId
     };
   }
 
+  var patchedId = String((patched && patched.id) || exactEventId);
+  if (patchedId !== exactEventId) {
+    return {
+      ok: false,
+      code: 'PATCH_EVENT_ID_CHANGED',
+      error: 'Calendar patch returned a different event ID; refusing to report success',
+      eventId: exactEventId,
+      patchedEventId: patchedId
+    };
+  }
+
+  var verify = verifyExactPatchedEvent_(resolved.calendarId, exactEventId, requestedIds);
+  if (!verify.ok) return verify;
+
   return {
     ok: true,
+    verified: true,
     action: 'student_number_tag_update',
     actionTaken: 'tagged',
-    eventId: String((patched && patched.id) || event.id || ''),
+    eventId: exactEventId,
     studentIds: requestedIds,
-    description: String((patched && patched.description) || nextDescription)
+    description: verify.description
   };
 }
 
@@ -407,7 +467,8 @@ function doGet(e) {
     mode: 'student-number-tags',
     readActions: ['student_number_tag_preview'],
     writeActions: ['student_number_tag_update'],
-    mutationScope: 'calendar-event-description-only'
+    mutationScope: 'calendar-event-description-only',
+    exactPostWriteVerification: true
   });
 }
 
