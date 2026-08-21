@@ -386,6 +386,10 @@ function upsertVerifiedEventIntoCalendarMirror_(calendarId, lessonKind, exactEve
   });
   replaceMirrorSheetRows_(studentsIndexSheet, MIRROR_STUDENTS_INDEX_HEADERS_, indexRows);
 
+  // GAS batches Spreadsheet writes. Force the verified monthlyLessons/group-ID
+  // changes to become visible before the web-app response tells React Admin to re-read.
+  SpreadsheetApp.flush();
+
   return {
     ok: true,
     eventKey: nextRow.eventKey,
