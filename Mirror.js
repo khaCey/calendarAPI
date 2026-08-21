@@ -181,6 +181,15 @@ function replaceMirrorSheetRows_(sheet, headers, rows) {
   var lastCol = Math.max(sheet.getLastColumn(), headers.length);
   if (lastRow > 1) sheet.getRange(2, 1, lastRow - 1, lastCol).clearContent();
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+
+  // Student IDs are identifiers, not numbers. Group values such as "392,393"
+  // must never be auto-coerced by Sheets into the numeric value 392393.
+  var studentIdIndex = headers.indexOf('studentId');
+  if (studentIdIndex !== -1) {
+    var formatRowCount = Math.max(sheet.getMaxRows() - 1, rows.length, 1);
+    sheet.getRange(2, studentIdIndex + 1, formatRowCount, 1).setNumberFormat('@');
+  }
+
   if (rows.length) sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
 }
 
@@ -209,7 +218,7 @@ function mirrorBuildStudentRows_(monthlyRows) {
 
 function mirrorReadStudentsIndexIds_(sheet) {
   if (!sheet || sheet.getLastRow() < 2) return [];
-  return sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).getValues()
+  return sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).getDisplayValues()
     .map(function (row) { return String(row[0] || '').trim(); })
     .filter(Boolean);
 }
@@ -328,10 +337,18 @@ function mirrorSourceByCalendarId_(calendarId, lessonKind) {
 
 function mirrorRowsFromSheet_(sheet) {
   if (!sheet || sheet.getLastRow() < 2) return [];
-  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, MIRROR_MONTHLY_HEADERS_.length).getValues();
-  return values.map(function (arr) {
+  var range = sheet.getRange(2, 1, sheet.getLastRow() - 1, MIRROR_MONTHLY_HEADERS_.length);
+  var values = range.getValues();
+  var displayed = range.getDisplayValues();
+  var studentIdIndex = MIRROR_MONTHLY_HEADERS_.indexOf('studentId');
+
+  return values.map(function (arr, rowIndex) {
     var obj = {};
-    for (var i = 0; i < MIRROR_MONTHLY_HEADERS_.length; i++) obj[MIRROR_MONTHLY_HEADERS_[i]] = arr[i];
+    for (var i = 0; i < MIRROR_MONTHLY_HEADERS_.length; i++) {
+      obj[MIRROR_MONTHLY_HEADERS_[i]] = i === studentIdIndex
+        ? String(displayed[rowIndex][i] || '').trim()
+        : arr[i];
+    }
     return obj;
   }).filter(function (row) { return String(row.eventKey || '').trim(); });
 }
