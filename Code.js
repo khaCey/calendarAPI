@@ -1,17 +1,15 @@
 /**
- * Green Square Student Number Tag API
+ * Green Square standalone schedule-sync / student-number API.
  *
- * Standalone branch derived from calendarAPI.
- * Purpose: allow REACT-ADMIN to safely inspect and attach student-number metadata
- * to EXISTING Google Calendar lesson events.
+ * The existing production calendarAPI is intentionally not used here.
+ * Normal preview/read data comes from the Sheet mirror. Direct Calendar access is
+ * reserved for background mirror synchronization and the exact tagging action.
  *
- * This API intentionally does NOT expose event create/delete/move/title/color APIs.
- * The only Calendar mutation is a description-only patch for the canonical tag:
- *
+ * The only Calendar mutation exposed here is a description-only patch for:
  *   [GS_STUDENT_IDS:123,456]
  */
 
-var STUDENT_NUMBER_TAG_API_REVISION = '2026-08-21-v2-exact-verify';
+var STUDENT_NUMBER_TAG_API_REVISION = '2026-08-21-v3-mirror';
 var GS_STUDENT_IDS_TAG_RE_ = /\[GS_STUDENT_IDS\s*:\s*([^\]]+)\]/gi;
 var GS_INSTANCE_SUFFIX_RE_ = /_\d{8}T\d{6}Z$/i;
 var GS_DB_SUFFIX_RE_ = /_\d{4}-\d{2}-\d{2}(?:_\d{2}-\d{2}-\d{2})?$/;
@@ -78,9 +76,7 @@ function normalizeStudentIds_(body) {
   for (var i = 0; i < raw.length; i++) {
     var id = String(raw[i] == null ? '' : raw[i]).trim();
     if (!id) continue;
-    if (!/^[A-Za-z0-9_-]+$/.test(id)) {
-      throw new Error('Invalid student ID: ' + id);
-    }
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new Error('Invalid student ID: ' + id);
     if (!seen[id]) {
       seen[id] = true;
       out.push(id);
@@ -145,7 +141,7 @@ function hasExactCanonicalStudentTag_(description, studentIds) {
   return String(description || '').indexOf(canonicalStudentTag_(studentIds)) !== -1;
 }
 
-/** Replace only the canonical GS tag. Preserve every other description byte as much as possible. */
+/** Replace only the canonical GS tag. Preserve all other description content. */
 function upsertCanonicalStudentTag_(description, studentIds) {
   var text = String(description || '');
   GS_STUDENT_IDS_TAG_RE_.lastIndex = 0;
@@ -269,10 +265,7 @@ function tryGetEvent_(calendarId, eventId) {
   }
 }
 
-/**
- * Resolve one exact existing event/occurrence without exposing calendar selection to REACT-ADMIN.
- * For recurring series, occurrenceStartIso is required before any update is allowed.
- */
+/** Resolve one exact existing event/occurrence for the tagging action. */
 function resolveTagTarget_(body) {
   var candidates = candidateEventIds_(body);
   if (!candidates.length) return { ok: false, code: 'MISSING_EVENT_ID', error: 'Missing event identifier' };
@@ -305,30 +298,6 @@ function resolveTagTarget_(body) {
   }
 
   return { ok: false, code: 'EVENT_NOT_FOUND', error: 'Calendar event not found' };
-}
-
-function previewStudentNumberTag_(body) {
-  var resolved = resolveTagTarget_(body);
-  if (!resolved.ok) return resolved;
-
-  var event = resolved.event || {};
-  var description = String(event.description || '');
-  var existingIds = parseStudentIdsFromDescription_(description);
-
-  return {
-    ok: true,
-    action: 'student_number_tag_preview',
-    found: true,
-    eventId: String(event.id || ''),
-    calendarKind: String((body && (body.lessonKind || body.kind)) || 'regular').toLowerCase(),
-    summary: String(event.summary || ''),
-    start: event.start || null,
-    end: event.end || null,
-    status: String(event.status || ''),
-    description: description,
-    existingStudentIds: existingIds,
-    hasCanonicalTag: /\[GS_STUDENT_IDS\s*:/i.test(description)
-  };
 }
 
 function verifyExactPatchedEvent_(calendarId, eventId, requestedIds) {
@@ -365,7 +334,37 @@ function verifyExactPatchedEvent_(calendarId, eventId, requestedIds) {
     ok: true,
     eventId: String((exact && exact.id) || eventId || ''),
     description: description,
-    studentIds: observedIds
+    studentIds: observedIds,
+    exactEvent: exact
+  };
+}
+
+function persistVerifiedTagToMirror_(calendarId, body, verifyResult) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    return upsertVerifiedEventIntoCalendarMirror_(
+      calendarId,
+      String((body && (body.lessonKind || body.kind)) || 'regular').toLowerCase(),
+      verifyResult.exactEvent
+    );
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function mirrorFailureResult_(calendarAction, eventId, requestedIds, verifyResult, err) {
+  return {
+    ok: false,
+    code: 'MIRROR_WRITE_FAILED',
+    error: 'Calendar tag was verified, but the Sheet mirror could not be updated: ' + String(err && err.message ? err.message : err),
+    calendarActionTaken: calendarAction,
+    calendarVerified: true,
+    calendarTagged: calendarAction === 'tagged',
+    mirrorUpdated: false,
+    eventId: eventId,
+    studentIds: requestedIds,
+    description: verifyResult && verifyResult.description ? verifyResult.description : ''
   };
 }
 
@@ -378,6 +377,17 @@ function updateStudentNumberTag_(body) {
   }
   if (!requestedIds.length) {
     return { ok: false, code: 'MISSING_STUDENT_IDS', error: 'studentIds is required' };
+  }
+
+  // Fail before Calendar mutation if the new mirror is not configured/writable.
+  try {
+    setupCalendarMirrorSpreadsheet();
+  } catch (mirrorPrepErr) {
+    return {
+      ok: false,
+      code: 'MIRROR_NOT_READY',
+      error: 'Calendar mirror is not ready: ' + String(mirrorPrepErr && mirrorPrepErr.message ? mirrorPrepErr.message : mirrorPrepErr)
+    };
   }
 
   var resolved = resolveTagTarget_(body);
@@ -407,9 +417,19 @@ function updateStudentNumberTag_(body) {
   if (nextDescription === description) {
     var alreadyVerify = verifyExactPatchedEvent_(resolved.calendarId, exactEventId, requestedIds);
     if (!alreadyVerify.ok) return alreadyVerify;
+
+    var alreadyMirror;
+    try {
+      alreadyMirror = persistVerifiedTagToMirror_(resolved.calendarId, body, alreadyVerify);
+    } catch (mirrorErr) {
+      return mirrorFailureResult_('already_tagged', exactEventId, requestedIds, alreadyVerify, mirrorErr);
+    }
+
     return {
       ok: true,
       verified: true,
+      mirrorUpdated: true,
+      mirror: alreadyMirror,
       action: 'student_number_tag_update',
       actionTaken: 'already_tagged',
       eventId: exactEventId,
@@ -448,9 +468,18 @@ function updateStudentNumberTag_(body) {
   var verify = verifyExactPatchedEvent_(resolved.calendarId, exactEventId, requestedIds);
   if (!verify.ok) return verify;
 
+  var mirrorResult;
+  try {
+    mirrorResult = persistVerifiedTagToMirror_(resolved.calendarId, body, verify);
+  } catch (mirrorWriteErr) {
+    return mirrorFailureResult_('tagged', exactEventId, requestedIds, verify, mirrorWriteErr);
+  }
+
   return {
     ok: true,
     verified: true,
+    mirrorUpdated: true,
+    mirror: mirrorResult,
     action: 'student_number_tag_update',
     actionTaken: 'tagged',
     eventId: exactEventId,
@@ -464,11 +493,14 @@ function doGet(e) {
   if (!isAuthorized_(e, params)) return jsonOutput_({ ok: false, error: 'Unauthorized' });
   return jsonOutput_({
     ok: true,
-    mode: 'student-number-tags',
-    readActions: ['student_number_tag_preview'],
+    mode: 'schedule-sync-and-student-tags',
+    readActions: ['calendar_mirror_read_month'],
+    syncActions: ['calendar_mirror_sync_month'],
     writeActions: ['student_number_tag_update'],
+    directCalendarPreview: false,
     mutationScope: 'calendar-event-description-only',
-    exactPostWriteVerification: true
+    exactPostWriteVerification: true,
+    mirrorRequiredForTagSuccess: true
   });
 }
 
@@ -482,8 +514,19 @@ function doPost(e) {
     }
 
     var action = String(body.action || '').trim().toLowerCase();
+
+    if (action === 'calendar_mirror_read_month') {
+      return jsonOutput_(readCalendarMirrorMonth(body.month));
+    }
+    if (action === 'calendar_mirror_sync_month') {
+      return jsonOutput_(syncMonthToCalendarMirror(body.month));
+    }
     if (action === 'student_number_tag_preview') {
-      return jsonOutput_(previewStudentNumberTag_(body));
+      return jsonOutput_({
+        ok: false,
+        code: 'DIRECT_CALENDAR_PREVIEW_DISABLED',
+        error: 'Direct Calendar preview is disabled. Read the Sheet mirror instead.'
+      });
     }
     if (action === 'student_number_tag_update') {
       return jsonOutput_(updateStudentNumberTag_(body));
@@ -492,7 +535,7 @@ function doPost(e) {
     return jsonOutput_({
       ok: false,
       code: 'UNSUPPORTED_ACTION',
-      error: 'Unsupported action. Only student_number_tag_preview and student_number_tag_update are available.'
+      error: 'Supported actions: calendar_mirror_read_month, calendar_mirror_sync_month, student_number_tag_update.'
     });
   } catch (err) {
     return jsonOutput_({
